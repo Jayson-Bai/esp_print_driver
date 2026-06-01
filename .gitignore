@@ -1,0 +1,8 @@
+build/
+sdkconfig.old
+.vscode/
+.settings/
+.cproject
+*.swp
+*.swo
+*~

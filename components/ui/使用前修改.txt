@@ -1,0 +1,12 @@
+1.ui/CMakeLists.txt:
+    导出CMakeLists版本写法不一致，图片部分可能有删减
+
+2.ui/ui.h:
+    注释掉#include "lv_i18n.h"
+
+3.ui/ui.c:
+    ①添加自定义功能头文件（motor.h ……）
+    ②最下方ui_init函数中添加 lv_disp_set_rotation(dispp, LV_DISP_ROT_90);
+
+4.每个screen对应的显示与事件回调函数:
+    ui.h与ui.c中声明并添加事件，对应screen的init中添加回调

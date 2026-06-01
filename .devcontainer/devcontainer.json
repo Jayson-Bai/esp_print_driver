@@ -1,0 +1,18 @@
+{
+    "name": "ESP-IDF PrintHead (Ubuntu240402LTS)",
+    "image": "Ubuntu240402LTS:esp-idf",
+    "workspaceMount": "source=${localWorkspaceFolder},target=/home/jaysonbai/esp/IDF_Test,type=bind",
+    "workspaceFolder": "/home/jaysonbai/esp/IDF_Test",
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-vscode.cpptools",
+                "espressif.esp-idf-extension",
+                "twxs.cmake",
+                "ms-vscode.cmake-tools"
+            ]
+        }
+    },
+    "postCreateCommand": "sudo chown -R jaysonbai:jaysonbai /home/jaysonbai/esp/IDF_Test",
+    "remoteUser": "jaysonbai"
+}
