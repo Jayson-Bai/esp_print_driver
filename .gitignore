@@ -6,3 +6,6 @@ sdkconfig.old
 *.swp
 *.swo
 *~
+
+# Local requirement/response notes
+docs/**/*.md

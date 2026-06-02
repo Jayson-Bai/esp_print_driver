@@ -5,10 +5,12 @@
 #include "temperature.h"
 #include "extruder_ctrl.h"
 #include "driver/gpio.h"
+#include "esp_timer.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdbool.h>
+#include <inttypes.h>
 #include "freertos/queue.h"
 
 // 从 uart0 读取数据
@@ -53,6 +55,12 @@ static QueueHandle_t uart_line_queue = NULL;
 static QueueHandle_t uart_event_queue = NULL;
 static volatile uint32_t uart_cmd_drop_count = 0;
 static volatile uint32_t uart_line_drop_count = 0;
+
+static portMUX_TYPE g_e_status_mux = portMUX_INITIALIZER_UNLOCKED;
+static int g_last_e_seq = -1;
+static int g_last_e_tool = 0;
+static float g_last_e_abs = 0.0f;
+static int64_t g_last_e_us = 0;
 
 // 初始化 uart0
 void uart0_init(int baud_rate)
@@ -135,46 +143,82 @@ static bool parse_event_cmd(const char *cmd, int *seq, char *event_type, char *a
     return true;
 }
 
-static void handle_event(const char *event_type, const char *arg)
+static void send_uart_line(const char *line)
+{
+    if (line == NULL) {
+        return;
+    }
+    uart0_write((const uint8_t *)line, strlen(line));
+}
+
+static void update_last_e_status(int seq, int tool_id, float total_mm, int64_t mcu_us)
+{
+    portENTER_CRITICAL(&g_e_status_mux);
+    g_last_e_seq = seq;
+    g_last_e_tool = tool_id;
+    g_last_e_abs = total_mm;
+    g_last_e_us = mcu_us;
+    portEXIT_CRITICAL(&g_e_status_mux);
+}
+
+static void get_last_e_status(int *seq, int *tool_id, float *total_mm, int64_t *mcu_us)
+{
+    portENTER_CRITICAL(&g_e_status_mux);
+    *seq = g_last_e_seq;
+    *tool_id = g_last_e_tool;
+    *total_mm = g_last_e_abs;
+    *mcu_us = g_last_e_us;
+    portEXIT_CRITICAL(&g_e_status_mux);
+}
+
+static void handle_event(int seq, const char *event_type, const char *arg)
 {
     if (!event_type || !arg) {
         return;
     }
 
+    char ack[96];
+    int64_t ack_us = esp_timer_get_time();
+    int ack_len = snprintf(ack, sizeof(ack), "EVACK %d %s accepted %" PRId64 "\n",
+                           seq, event_type, ack_us);
+    if (ack_len > 0) {
+        send_uart_line(ack);
+    }
+
     if (strcmp(event_type, "heat_cf") == 0) {
         float temp = strtof(arg, NULL);
         PID_send_command(1, temp, temp > 0.0f);
-        return;
+        goto done;
     }
     if (strcmp(event_type, "heat_resin") == 0) {
         float temp = strtof(arg, NULL);
         PID_send_command(2, temp, temp > 0.0f);
-        return;
+        goto done;
     }
     if (strcmp(event_type, "tool_change_cf") == 0) {
         switch_to_CF();
         g_current_tool_id = 1;
-        return;
+        goto done;
     }
     if (strcmp(event_type, "tool_change_resin") == 0) {
         switch_to_RESIN();
         g_current_tool_id = 2;
-        return;
+        goto done;
     }
     if (strcmp(event_type, "fan_cf") == 0) {
         bool enable = (strtol(arg, NULL, 10) != 0);
         fan_set_state(FAN1, enable);
-        return;
+        goto done;
     }
     if (strcmp(event_type, "fan_resin") == 0) {
         bool enable = (strtol(arg, NULL, 10) != 0);
         fan_set_state(FAN2, enable);
-        return;
+        goto done;
     }
     if (strcmp(event_type, "extrude_reset") == 0) {
         int tool_id = (int)strtol(arg, NULL, 10);
         extruder_reset_absolute(tool_id);
-        return;
+        goto done;
     }
     if (strcmp(event_type, "pid_set_cf") == 0) {
         float kp, ki, kd, max_o, min_o, max_i, min_i;
@@ -182,7 +226,7 @@ static void handle_event(const char *event_type, const char *arg)
                    &kp, &ki, &kd, &max_o, &min_o, &max_i, &min_i) == 7) {
             pid_set_params(1, kp, ki, kd, max_o, min_o, max_i, min_i);
         }
-        return;
+        goto done;
     }
     if (strcmp(event_type, "pid_set_resin") == 0) {
         float kp, ki, kd, max_o, min_o, max_i, min_i;
@@ -190,17 +234,64 @@ static void handle_event(const char *event_type, const char *arg)
                    &kp, &ki, &kd, &max_o, &min_o, &max_i, &min_i) == 7) {
             pid_set_params(2, kp, ki, kd, max_o, min_o, max_i, min_i);
         }
-        return;
+        goto done;
+    }
+
+done:
+    {
+        char done_msg[96];
+        int64_t done_us = esp_timer_get_time();
+        int done_len = snprintf(done_msg, sizeof(done_msg), "EVDONE %d %s done %" PRId64 "\n",
+                                seq, event_type, done_us);
+        if (done_len > 0) {
+            send_uart_line(done_msg);
+        }
     }
 }
 
-static void handle_extrude_cmd(int tool_id, float total_mm)
+static void handle_extrude_cmd(int seq, int tool_id, float total_mm)
 {
     if (tool_id != 1 && tool_id != 2) {
         return;
     }
 
+    int last_seq;
+    int last_tool;
+    float last_abs;
+    int64_t last_us;
+    get_last_e_status(&last_seq, &last_tool, &last_abs, &last_us);
+
+    if (last_seq >= 0 && seq <= last_seq) {
+        char warn[96];
+        int len = snprintf(warn, sizeof(warn), "EWARN old_seq=%d last_e_seq=%d\n",
+                           seq, last_seq);
+        if (len > 0) {
+            send_uart_line(warn);
+        }
+        return;
+    }
+
+    if (last_seq >= 0 && seq > last_seq + 1) {
+        char warn[112];
+        int len = snprintf(warn, sizeof(warn),
+                           "EWARN gap expected=%d got=%d last_e_seq=%d\n",
+                           last_seq + 1, seq, last_seq);
+        if (len > 0) {
+            send_uart_line(warn);
+        }
+    }
+
     extruder_set_absolute(tool_id, total_mm);
+
+    int64_t mcu_us = esp_timer_get_time();
+    update_last_e_status(seq, tool_id, total_mm, mcu_us);
+
+    char ack[96];
+    int len = snprintf(ack, sizeof(ack), "EACK %d %d %.3f %" PRId64 "\n",
+                       seq, tool_id, total_mm, mcu_us);
+    if (len > 0) {
+        send_uart_line(ack);
+    }
 }
 
 static void handle_line(char *cmd)
@@ -335,9 +426,9 @@ static void command_dispatch_task(void *pvParameters)
     while (1) {
         if (xQueueReceive(uart_cmd_queue, &msg, portMAX_DELAY) == pdTRUE) {
             if (msg.type == UART_CMD_EXTRUDE) {
-                handle_extrude_cmd(msg.tool_id, msg.total_mm);
+                handle_extrude_cmd(msg.seq, msg.tool_id, msg.total_mm);
             } else if (msg.type == UART_CMD_EVENT) {
-                handle_event(msg.event_type, msg.arg);
+                handle_event(msg.seq, msg.event_type, msg.arg);
             }
         }
     }
@@ -367,7 +458,7 @@ static void status_task(void *pvParameters)
 {
     (void)pvParameters;
 
-    char buf[192];
+    char buf[256];
     TickType_t last_wake = xTaskGetTickCount();
 
     while (1) {
@@ -393,11 +484,19 @@ static void status_task(void *pvParameters)
             tool = 0;
         }
 
+        int last_seq;
+        int last_tool;
+        float last_abs;
+        int64_t last_us;
+        get_last_e_status(&last_seq, &last_tool, &last_abs, &last_us);
+
         int len = snprintf(buf, sizeof(buf),
                            "STAT temp_cf=%.1f temp_resin=%.1f target_cf=%.1f target_resin=%.1f "
-                           "fan_ok_cf=%d fan_ok_resin=%d tool=%d err=%d\n",
+                           "fan_ok_cf=%d fan_ok_resin=%d tool=%d err=%d "
+                           "last_e_seq=%d last_e_tool=%d last_e_abs=%.3f last_e_us=%" PRId64 "\n",
                            temp_cf, temp_resin, target_cf, target_resin,
-                           fan_ok_cf, fan_ok_resin, tool, err);
+                           fan_ok_cf, fan_ok_resin, tool, err,
+                           last_seq, last_tool, last_abs, last_us);
         if (len > 0) {
             if (len > (int)sizeof(buf)) {
                 len = sizeof(buf);
