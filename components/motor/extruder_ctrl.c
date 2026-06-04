@@ -238,7 +238,14 @@ static void extruder_task(void *pvParameters)
 
             float error = target_steps - g_emit_steps_total[idx];
             float abs_error = fabsf(error);
-            if (abs_error <= 0.0f || g_stop_request[idx]) {
+            if (g_stop_request[idx]) {
+                portENTER_CRITICAL(&g_extruder_mux);
+                g_stop_request[idx] = false;
+                portEXIT_CRITICAL(&g_extruder_mux);
+                gpio_set_level(en_pin, 1);
+                continue;
+            }
+            if (abs_error <= 0.0f) {
                 gpio_set_level(en_pin, 1);
                 continue;
             }
@@ -250,12 +257,15 @@ static void extruder_task(void *pvParameters)
             }
 
             motor_dir_t dir = (dir_sign > 0) ? CCW : CW;
-            float base_steps_per_s = g_ui_active[idx]
-                ? (tool_id == 1
+            float base_steps_per_s;
+            if (g_ui_active[idx]) {
+                float ui_mm_per_s = (tool_id == 1)
                     ? (dir_sign > 0 ? motor3_get_speed_mm_per_s() : motor3_get_retract_speed_mm_per_s())
-                    : (dir_sign > 0 ? motor4_get_speed_mm_per_s() : motor4_get_retract_speed_mm_per_s()))
-                : fabsf(host_steps_per_s);
-            base_steps_per_s *= steps_per_mm_for_tool(tool_id);
+                    : (dir_sign > 0 ? motor4_get_speed_mm_per_s() : motor4_get_retract_speed_mm_per_s());
+                base_steps_per_s = ui_mm_per_s * steps_per_mm_for_tool(tool_id);
+            } else {
+                base_steps_per_s = fabsf(host_steps_per_s);
+            }
             float steps_per_s = base_steps_per_s + EXTRUDER_ERR_K * abs_error;
             if (steps_per_s <= 0.0f) {
                 continue;
