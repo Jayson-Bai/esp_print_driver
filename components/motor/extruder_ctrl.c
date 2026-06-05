@@ -5,6 +5,7 @@
 #include "driver/gpio.h"
 #include "driver/rmt_tx.h"
 #include "driver/rmt_encoder.h"
+#include "esp_timer.h"
 #include <math.h>
 
 #define EXTRUDER_MAX_STEPS 400        // 单片最大步数上限，可调
@@ -206,13 +207,21 @@ static void extruder_task(void *pvParameters)
     motor4_gpio_init();
 
     TickType_t last_wake = xTaskGetTickCount();
-    TickType_t slice_ticks = pdMS_TO_TICKS(EXTRUDER_SLICE_US / 1000);
+    TickType_t slice_ticks = pdMS_TO_TICKS(1);
     if (slice_ticks == 0) {
         slice_ticks = 1;
     }
+    int64_t last_loop_us = esp_timer_get_time();
 
     while (1) {
         vTaskDelayUntil(&last_wake, slice_ticks);
+
+        int64_t now_us = esp_timer_get_time();
+        float elapsed_s = (float)(now_us - last_loop_us) / 1000000.0f;
+        last_loop_us = now_us;
+        if (elapsed_s <= 0.0f) {
+            elapsed_s = (float)EXTRUDER_SLICE_US / 1000000.0f;
+        }
 
         for (int tool_id = 1; tool_id <= 2; tool_id++) {
             int idx = tool_id - 1;
@@ -224,7 +233,7 @@ static void extruder_task(void *pvParameters)
                     ? (ui_dir_sign > 0 ? motor3_get_speed_mm_per_s() : motor3_get_retract_speed_mm_per_s())
                     : (ui_dir_sign > 0 ? motor4_get_speed_mm_per_s() : motor4_get_retract_speed_mm_per_s());
                 if (speed > 0.0f) {
-                    float delta_mm = speed * ((float)EXTRUDER_SLICE_US / 1000000.0f) * (float)ui_dir_sign;
+                    float delta_mm = speed * elapsed_s * (float)ui_dir_sign;
                     g_ui_abs_mm[idx] += delta_mm;
                     extruder_set_absolute(tool_id, g_ui_abs_mm[idx]);
                 }
@@ -270,20 +279,22 @@ static void extruder_task(void *pvParameters)
             if (steps_per_s <= 0.0f) {
                 continue;
             }
-            float inc = steps_per_s * ((float)EXTRUDER_SLICE_US / 1000000.0f);
+            float inc = steps_per_s * elapsed_s;
             g_phase_accum[idx] += inc;
 
-            int steps_to_send = (int)g_phase_accum[idx];
-            if (steps_to_send > (int)abs_error) {
-                steps_to_send = (int)abs_error;
+            int desired_steps = (int)g_phase_accum[idx];
+            int available_steps = (int)abs_error;
+            int steps_to_send = desired_steps;
+            if (steps_to_send > available_steps) {
+                steps_to_send = available_steps;
             }
             if (steps_to_send > EXTRUDER_MAX_STEPS) {
                 steps_to_send = EXTRUDER_MAX_STEPS;
             }
-            g_phase_accum[idx] -= (float)steps_to_send;
             if (steps_to_send <= 0) {
                 continue;
             }
+            g_phase_accum[idx] -= (float)steps_to_send;
 
             gpio_set_level(en_pin, 0);
             pulse_steps(tool_id, dir, steps_to_send);
