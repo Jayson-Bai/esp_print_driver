@@ -12,6 +12,9 @@
 #include <stdbool.h>
 #include <inttypes.h>
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
+
+static SemaphoreHandle_t g_uart_tx_mutex = NULL;
 
 // 从 uart0 读取数据
 int uart0_read(uint8_t *buf, int max_len, TickType_t ticks_to_wait)
@@ -26,7 +29,17 @@ int uart0_read(uint8_t *buf, int max_len, TickType_t ticks_to_wait)
 // 向 uart0 发送数据
 esp_err_t uart0_write(const uint8_t *data, int len)
 {
+    if (data == NULL || len <= 0) {
+        return ESP_OK;
+    }
+
+    if (g_uart_tx_mutex != NULL) {
+        xSemaphoreTake(g_uart_tx_mutex, portMAX_DELAY);
+    }
     int res = uart_write_bytes(UART_PORT, (const char*)data, len);
+    if (g_uart_tx_mutex != NULL) {
+        xSemaphoreGive(g_uart_tx_mutex);
+    }
     return (res == len) ? ESP_OK : ESP_FAIL;
 }
 
@@ -76,6 +89,9 @@ void uart0_init(int baud_rate)
     uart_driver_install(UART_PORT, BUF_SIZE * 2, BUF_SIZE * 2, 30, &uart_event_queue, 0);
     uart_param_config(UART_PORT, &uart_config);
     uart_set_pin(UART_PORT, UART_TX, UART_RX, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    if (g_uart_tx_mutex == NULL) {
+        g_uart_tx_mutex = xSemaphoreCreateMutex();
+    }
 }
 
 // ---------------- 工具函数：去尾空白 ----------------
@@ -161,6 +177,16 @@ static void update_last_e_status(int seq, int tool_id, float total_mm, int64_t m
     portEXIT_CRITICAL(&g_e_status_mux);
 }
 
+static void reset_last_e_status(void)
+{
+    portENTER_CRITICAL(&g_e_status_mux);
+    g_last_e_seq = -1;
+    g_last_e_tool = 0;
+    g_last_e_abs = 0.0f;
+    g_last_e_us = 0;
+    portEXIT_CRITICAL(&g_e_status_mux);
+}
+
 static void get_last_e_status(int *seq, int *tool_id, float *total_mm, int64_t *mcu_us)
 {
     portENTER_CRITICAL(&g_e_status_mux);
@@ -217,24 +243,66 @@ static void handle_event(int seq, const char *event_type, const char *arg)
     }
     if (strcmp(event_type, "extrude_reset") == 0) {
         int tool_id = (int)strtol(arg, NULL, 10);
+        if (tool_id != 1 && tool_id != 2) {
+            char err_msg[96];
+            int64_t err_us = esp_timer_get_time();
+            int err_len = snprintf(err_msg, sizeof(err_msg),
+                                   "EVERR %d %s invalid_tool %d %" PRId64 "\n",
+                                   seq, event_type, tool_id, err_us);
+            if (err_len > 0) {
+                send_uart_line(err_msg);
+            }
+            return;
+        }
         extruder_reset_absolute(tool_id);
+        reset_last_e_status();
         goto done;
     }
     if (strcmp(event_type, "pid_set_cf") == 0) {
         float kp, ki, kd, max_o, min_o, max_i, min_i;
         if (sscanf(arg, "%f %f %f %f %f %f %f",
-                   &kp, &ki, &kd, &max_o, &min_o, &max_i, &min_i) == 7) {
-            pid_set_params(1, kp, ki, kd, max_o, min_o, max_i, min_i);
+                   &kp, &ki, &kd, &max_o, &min_o, &max_i, &min_i) != 7) {
+            char err_msg[96];
+            int64_t err_us = esp_timer_get_time();
+            int err_len = snprintf(err_msg, sizeof(err_msg),
+                                   "EVERR %d %s invalid_args %" PRId64 "\n",
+                                   seq, event_type, err_us);
+            if (err_len > 0) {
+                send_uart_line(err_msg);
+            }
+            return;
         }
+        pid_set_params(1, kp, ki, kd, max_o, min_o, max_i, min_i);
         goto done;
     }
     if (strcmp(event_type, "pid_set_resin") == 0) {
         float kp, ki, kd, max_o, min_o, max_i, min_i;
         if (sscanf(arg, "%f %f %f %f %f %f %f",
-                   &kp, &ki, &kd, &max_o, &min_o, &max_i, &min_i) == 7) {
-            pid_set_params(2, kp, ki, kd, max_o, min_o, max_i, min_i);
+                   &kp, &ki, &kd, &max_o, &min_o, &max_i, &min_i) != 7) {
+            char err_msg[96];
+            int64_t err_us = esp_timer_get_time();
+            int err_len = snprintf(err_msg, sizeof(err_msg),
+                                   "EVERR %d %s invalid_args %" PRId64 "\n",
+                                   seq, event_type, err_us);
+            if (err_len > 0) {
+                send_uart_line(err_msg);
+            }
+            return;
         }
+        pid_set_params(2, kp, ki, kd, max_o, min_o, max_i, min_i);
         goto done;
+    }
+
+    {
+        char err_msg[96];
+        int64_t err_us = esp_timer_get_time();
+        int err_len = snprintf(err_msg, sizeof(err_msg),
+                               "EVERR %d %s unknown_event %" PRId64 "\n",
+                               seq, event_type, err_us);
+        if (err_len > 0) {
+            send_uart_line(err_msg);
+        }
+        return;
     }
 
 done:
@@ -314,7 +382,7 @@ static void handle_line(char *cmd)
 
     if (parse_extrude_cmd(cmd, &msg.seq, &msg.tool_id, &msg.total_mm)) {
         msg.type = UART_CMD_EXTRUDE;
-        if (xQueueSend(uart_cmd_queue, &msg, 0) != pdTRUE) {
+        if (xQueueSend(uart_cmd_queue, &msg, portMAX_DELAY) != pdTRUE) {
             uart_cmd_drop_count++;
         }
         return;
@@ -322,7 +390,7 @@ static void handle_line(char *cmd)
 
     if (parse_event_cmd(cmd, &msg.seq, msg.event_type, msg.arg)) {
         msg.type = UART_CMD_EVENT;
-        if (xQueueSend(uart_cmd_queue, &msg, 0) != pdTRUE) {
+        if (xQueueSend(uart_cmd_queue, &msg, portMAX_DELAY) != pdTRUE) {
             uart_cmd_drop_count++;
         }
         return;
@@ -373,7 +441,7 @@ void serial_rx_task(void *pvParameters)
                             memcpy(msg.line, line_buf, copy_len);
                             msg.line[copy_len] = '\0';
                             if (uart_line_queue != NULL) {
-                                if (xQueueSend(uart_line_queue, &msg, 0) != pdTRUE) {
+                                if (xQueueSend(uart_line_queue, &msg, pdMS_TO_TICKS(10)) != pdTRUE) {
                                     uart_line_drop_count++;
                                 }
                             }
@@ -437,7 +505,7 @@ static void command_dispatch_task(void *pvParameters)
 void command_dispatch_task_start(void)
 {
     if (uart_cmd_queue == NULL) {
-        uart_cmd_queue = xQueueCreate(128, sizeof(uart_cmd_t));
+        uart_cmd_queue = xQueueCreate(512, sizeof(uart_cmd_t));
     }
     xTaskCreatePinnedToCore(command_dispatch_task, "cmd_dispatch", 4096, NULL, 6, NULL, 1);
 }
@@ -445,10 +513,10 @@ void command_dispatch_task_start(void)
 void serial_tasks_start(void)
 {
     if (uart_line_queue == NULL) {
-        uart_line_queue = xQueueCreate(128, sizeof(uart_line_t));
+        uart_line_queue = xQueueCreate(512, sizeof(uart_line_t));
     }
     if (uart_cmd_queue == NULL) {
-        uart_cmd_queue = xQueueCreate(128, sizeof(uart_cmd_t));
+        uart_cmd_queue = xQueueCreate(512, sizeof(uart_cmd_t));
     }
     xTaskCreatePinnedToCore(serial_rx_task, "serial_rx", 4096, NULL, 7, NULL, 1);
     xTaskCreatePinnedToCore(serial_parse_task, "serial_parse", 4096, NULL, 6, NULL, 1);
