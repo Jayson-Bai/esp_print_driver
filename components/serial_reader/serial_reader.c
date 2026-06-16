@@ -441,7 +441,7 @@ void serial_rx_task(void *pvParameters)
                             memcpy(msg.line, line_buf, copy_len);
                             msg.line[copy_len] = '\0';
                             if (uart_line_queue != NULL) {
-                                if (xQueueSend(uart_line_queue, &msg, pdMS_TO_TICKS(10)) != pdTRUE) {
+                                if (xQueueSend(uart_line_queue, &msg, portMAX_DELAY) != pdTRUE) {
                                     uart_line_drop_count++;
                                 }
                             }
