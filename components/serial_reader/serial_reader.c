@@ -505,7 +505,7 @@ static void command_dispatch_task(void *pvParameters)
 void command_dispatch_task_start(void)
 {
     if (uart_cmd_queue == NULL) {
-        uart_cmd_queue = xQueueCreate(512, sizeof(uart_cmd_t));
+        uart_cmd_queue = xQueueCreate(128, sizeof(uart_cmd_t));
     }
     xTaskCreatePinnedToCore(command_dispatch_task, "cmd_dispatch", 4096, NULL, 6, NULL, 1);
 }
@@ -513,10 +513,10 @@ void command_dispatch_task_start(void)
 void serial_tasks_start(void)
 {
     if (uart_line_queue == NULL) {
-        uart_line_queue = xQueueCreate(512, sizeof(uart_line_t));
+        uart_line_queue = xQueueCreate(128, sizeof(uart_line_t));
     }
     if (uart_cmd_queue == NULL) {
-        uart_cmd_queue = xQueueCreate(512, sizeof(uart_cmd_t));
+        uart_cmd_queue = xQueueCreate(128, sizeof(uart_cmd_t));
     }
     xTaskCreatePinnedToCore(serial_rx_task, "serial_rx", 4096, NULL, 7, NULL, 1);
     xTaskCreatePinnedToCore(serial_parse_task, "serial_parse", 4096, NULL, 6, NULL, 1);
