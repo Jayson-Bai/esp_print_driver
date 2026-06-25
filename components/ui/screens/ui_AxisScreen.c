@@ -528,6 +528,7 @@ void ui_AxisScreen_screen_init(void)
     lv_obj_add_event_cb(ui_CutterResetButton, ui_event_CutterResetButton,LV_EVENT_ALL, NULL);
     lv_obj_add_event_cb(ui_CutterDownButton, ui_event_CutterDownButton,LV_EVENT_ALL, NULL);
     lv_obj_add_event_cb(ui_CutterStopButton, ui_event_CutterStopButton, LV_EVENT_ALL, NULL);
+    lv_obj_add_event_cb(ui_CutButton, ui_event_CutButton, LV_EVENT_ALL, NULL);
     lv_obj_add_event_cb(ui_Up1Button1, ui_event_Up1Button1, LV_EVENT_ALL, NULL);
     lv_obj_add_event_cb(ui_Up1Button2, ui_event_Up1Button2, LV_EVENT_ALL, NULL);
     lv_obj_add_event_cb(ui_Up1Button3, ui_event_Up1Button3, LV_EVENT_ALL, NULL);

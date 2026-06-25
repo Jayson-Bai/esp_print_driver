@@ -88,6 +88,7 @@ extern lv_obj_t * ui_Down1Button3;
 extern lv_obj_t * ui_Label10mmDown1;
 extern lv_obj_t * ui_CutButton;
 extern lv_obj_t * ui_CutLabel;
+void ui_event_CutButton(lv_event_t * e);
 extern lv_obj_t * ui_Up2Button1;
 extern lv_obj_t * ui_Label1mmUp2;
 extern lv_obj_t * ui_Up2Button2;

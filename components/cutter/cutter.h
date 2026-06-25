@@ -6,6 +6,7 @@
 //引脚
 #define K1_PIN      16
 #define K2_PIN      17
+#define CUT_PIN     15
 #define SW1_PIN     19
 #define SW2_PIN     20
 

@@ -16,7 +16,7 @@ void cutter_gpio_init(void) {
         .intr_type = GPIO_INTR_DISABLE
     };
 
-    gpio_num_t output_pins[] = { K1_PIN, K2_PIN, SW1_PIN, SW2_PIN };
+    gpio_num_t output_pins[] = { K1_PIN, K2_PIN, CUT_PIN, SW1_PIN, SW2_PIN };
     for (int i = 0; i < sizeof(output_pins) / sizeof(output_pins[0]); i++) {
         io_conf.pin_bit_mask = 1ULL << output_pins[i];
         gpio_config(&io_conf);
@@ -24,6 +24,7 @@ void cutter_gpio_init(void) {
 
     gpio_set_level(K1_PIN, 1);  //控制模块默认低电平触发
     gpio_set_level(K2_PIN, 1);
+    gpio_set_level(CUT_PIN, 0); // MOS 默认关闭，高电平触发
     gpio_set_level(SW1_PIN, 1); 
     gpio_set_level(SW2_PIN, 1);
 
