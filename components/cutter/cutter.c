@@ -34,6 +34,62 @@ void cutter_gpio_init(void) {
 
 static bool sw1_locked = false;
 static bool sw2_locked = false;
+static volatile bool cut_sequence_running = false;
+
+static bool cutter_try_begin_cut_sequence(void)
+{
+    if (cut_sequence_running) {
+        return false;
+    }
+    cut_sequence_running = true;
+    return true;
+}
+
+static void cutter_run_cut_sequence(void)
+{
+    cutter_send_command(K1_PIN, false);
+    vTaskDelay(pdMS_TO_TICKS(7000));
+
+    gpio_set_level(CUT_PIN, 1);
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    gpio_set_level(CUT_PIN, 0);
+    vTaskDelay(pdMS_TO_TICKS(1000));
+
+    cutter_send_command(K2_PIN, false);
+}
+
+static void cutter_cut_sequence_task(void *pvParameters)
+{
+    (void)pvParameters;
+    cutter_run_cut_sequence();
+    cut_sequence_running = false;
+    vTaskDelete(NULL);
+}
+
+bool cutter_start_cut_sequence_task(void)
+{
+    if (!cutter_try_begin_cut_sequence()) {
+        return false;
+    }
+
+    if (xTaskCreate(cutter_cut_sequence_task, "cut_sequence", 2048, NULL, 2, NULL) != pdPASS) {
+        cut_sequence_running = false;
+        return false;
+    }
+
+    return true;
+}
+
+bool cutter_run_cut_sequence_if_idle(void)
+{
+    if (!cutter_try_begin_cut_sequence()) {
+        return false;
+    }
+
+    cutter_run_cut_sequence();
+    cut_sequence_running = false;
+    return true;
+}
 
 
 void cutter_task(void *pvParameters) {

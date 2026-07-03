@@ -2,6 +2,7 @@
 #include "serial_reader.h"
 #include "pid_ctrl.h"
 #include "fan.h"
+#include "cutter.h"
 #include "temperature.h"
 #include "extruder_ctrl.h"
 #include "driver/gpio.h"
@@ -239,6 +240,20 @@ static void handle_event(int seq, const char *event_type, const char *arg)
     if (strcmp(event_type, "fan_resin") == 0) {
         bool enable = (strtol(arg, NULL, 10) != 0);
         fan_set_state(FAN2, enable);
+        goto done;
+    }
+    if (strcmp(event_type, "cut") == 0) {
+        if (!cutter_run_cut_sequence_if_idle()) {
+            char err_msg[96];
+            int64_t err_us = esp_timer_get_time();
+            int err_len = snprintf(err_msg, sizeof(err_msg),
+                                   "EVERR %d %s busy %" PRId64 "\n",
+                                   seq, event_type, err_us);
+            if (err_len > 0) {
+                send_uart_line(err_msg);
+            }
+            return;
+        }
         goto done;
     }
     if (strcmp(event_type, "extrude_reset") == 0) {

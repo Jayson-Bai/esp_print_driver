@@ -130,7 +130,6 @@ lv_obj_t * ui_CutterStopText;
 void ui_event_CutterStopButton(lv_event_t * e);
 void ui_event_CutterResetButton(lv_event_t * e);
 void ui_event_CutterDownButton(lv_event_t * e);
-static void ui_cut_sequence_task(void *pvParameters);
 //纤维轴事件
 void ui_event_Up1Button1(lv_event_t * e);
 void ui_event_Up1Button2(lv_event_t * e);
@@ -234,7 +233,6 @@ lv_obj_t * ui____initial_actions0;
 // IMAGES AND IMAGE SETS
 const lv_img_dsc_t * ui_imgset_browser_extruder[3] = {&ui_img_browser_extruder1_png, &ui_img_browser_extruder2_png, &ui_img_browser_extruder3_png};
 const lv_img_dsc_t * ui_imgset_fan[1] = {&ui_img_fan1_png};
-static volatile bool cut_sequence_running = false;
 
 ///////////////////// TEST LVGL SETTINGS ////////////////////
 #if LV_COLOR_DEPTH != 16
@@ -276,33 +274,12 @@ void ui_event_CalibrationButton(lv_event_t * e)
 }
 
 
-
-static void ui_cut_sequence_task(void *pvParameters)
-{
-    (void)pvParameters;
-
-    ui_event_CutterDownButton(NULL);
-    vTaskDelay(pdMS_TO_TICKS(1000));
-
-    gpio_set_level(CUT_PIN, 1);
-    vTaskDelay(pdMS_TO_TICKS(3000));
-    gpio_set_level(CUT_PIN, 0);
-    vTaskDelay(pdMS_TO_TICKS(1000));
-
-    ui_event_CutterResetButton(NULL);
-    cut_sequence_running = false;
-    vTaskDelete(NULL);
-}
-
 void ui_event_CutButton(lv_event_t * e)
 {
     lv_event_code_t event_code = lv_event_get_code(e);
 
-    if(event_code == LV_EVENT_CLICKED && !cut_sequence_running) {
-        cut_sequence_running = true;
-        if (xTaskCreate(ui_cut_sequence_task, "cut_sequence", 2048, NULL, 2, NULL) != pdPASS) {
-            cut_sequence_running = false;
-        }
+    if(event_code == LV_EVENT_CLICKED) {
+        cutter_start_cut_sequence_task();
     }
 }
 #pragma endregion

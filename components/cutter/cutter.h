@@ -18,4 +18,6 @@ typedef struct {
 void cutter_gpio_init(void);
 void cutter_task(void *pvParameters);
 void cutter_send_command(int PIN_NUM, bool state);
+bool cutter_start_cut_sequence_task(void);
+bool cutter_run_cut_sequence_if_idle(void);
 
