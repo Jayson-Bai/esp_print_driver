@@ -150,6 +150,10 @@ static bool parse_event_cmd(const char *cmd, int *seq, char *event_type, char *a
         event_type[i++] = *cmd++;
     }
     event_type[i] = '\0';
+    if (*cmd == '\0') {
+        arg[0] = '\0';
+        return true;
+    }
     if (*cmd != ' ') return false;
     cmd++;
     i = 0;
@@ -198,6 +202,63 @@ static void get_last_e_status(int *seq, int *tool_id, float *total_mm, int64_t *
     portEXIT_CRITICAL(&g_e_status_mux);
 }
 
+typedef struct {
+    int seq;
+    char event_type[32];
+    bool active;
+} cut_event_done_ctx_t;
+
+static portMUX_TYPE g_cut_event_done_mux = portMUX_INITIALIZER_UNLOCKED;
+static cut_event_done_ctx_t g_cut_event_done_ctx;
+
+static void clear_cut_event_done_context(void)
+{
+    portENTER_CRITICAL(&g_cut_event_done_mux);
+    g_cut_event_done_ctx.active = false;
+    portEXIT_CRITICAL(&g_cut_event_done_mux);
+}
+
+static void prepare_cut_event_done_context(int seq, const char *event_type)
+{
+    (void)event_type;
+
+    portENTER_CRITICAL(&g_cut_event_done_mux);
+    g_cut_event_done_ctx.seq = seq;
+    g_cut_event_done_ctx.event_type[0] = 'c';
+    g_cut_event_done_ctx.event_type[1] = 'u';
+    g_cut_event_done_ctx.event_type[2] = 't';
+    g_cut_event_done_ctx.event_type[3] = '\0';
+    g_cut_event_done_ctx.active = true;
+    portEXIT_CRITICAL(&g_cut_event_done_mux);
+}
+
+static void cut_event_done_callback(void *ctx)
+{
+    cut_event_done_ctx_t done_ctx;
+    cut_event_done_ctx_t *src = (cut_event_done_ctx_t *)ctx;
+
+    if (src == NULL) {
+        return;
+    }
+
+    portENTER_CRITICAL(&g_cut_event_done_mux);
+    done_ctx = *src;
+    src->active = false;
+    portEXIT_CRITICAL(&g_cut_event_done_mux);
+
+    if (!done_ctx.active) {
+        return;
+    }
+
+    char done_msg[96];
+    int64_t done_us = esp_timer_get_time();
+    int done_len = snprintf(done_msg, sizeof(done_msg), "EVDONE %d %s done %" PRId64 "\n",
+                            done_ctx.seq, done_ctx.event_type, done_us);
+    if (done_len > 0) {
+        send_uart_line(done_msg);
+    }
+}
+
 static void handle_event(int seq, const char *event_type, const char *arg)
 {
     if (!event_type || !arg) {
@@ -243,7 +304,9 @@ static void handle_event(int seq, const char *event_type, const char *arg)
         goto done;
     }
     if (strcmp(event_type, "cut") == 0) {
-        if (!cutter_run_cut_sequence_if_idle()) {
+        prepare_cut_event_done_context(seq, event_type);
+        if (!cutter_start_cut_sequence_async(cut_event_done_callback, &g_cut_event_done_ctx)) {
+            clear_cut_event_done_context();
             char err_msg[96];
             int64_t err_us = esp_timer_get_time();
             int err_len = snprintf(err_msg, sizeof(err_msg),
@@ -254,7 +317,7 @@ static void handle_event(int seq, const char *event_type, const char *arg)
             }
             return;
         }
-        goto done;
+        return;
     }
     if (strcmp(event_type, "extrude_reset") == 0) {
         int tool_id = (int)strtol(arg, NULL, 10);

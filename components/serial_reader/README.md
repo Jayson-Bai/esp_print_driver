@@ -49,6 +49,7 @@ EV <seq> extrude_reset <tool_id>\n
 - reset 完成后的下一次或后续 `STAT` 必须显示 `last_e_seq=-1 last_e_abs=0.000 last_e_us=0`；`last_e_seq=-1` 是有符号语义，表示去重状态已清空。此后固件必须接受新的 `E 0 <tool_id> <total_mm>`。
 - `STAT` 稳定提供上位机判断所需字段：`temp_cf/temp_resin/target_cf/target_resin/fan_ok_cf/fan_ok_resin/tool/err/last_e_seq/last_e_abs/last_e_us`。
 - 手动准备命令（如 `EV 0 fan_resin 1`、`EV 0 heat_resin <temp>`）也返回 `EVACK`/`EVDONE`；防止 `E` 被 `old_seq` 丢弃的严格门控仍以后续 NPZ 中的 `extrude_reset` 确认链为准。
+- `EV <seq> cut [arg]` 为异步事件：固件收到后立即返回 `EVACK` 并启动剪切后台任务，`command_dispatch_task` 不等待剪切完成，后续 `E <seq> <tool_id> <total_mm>` 会继续按序号和绝对 E 值实时执行。剪切动作真正结束后，后台任务单独回传 `EVDONE <seq> cut done <mcu_us>`；该反馈仅表示剪切完成，不作为恢复 E 指令队列的门控。
 - 线缓冲长度 256 字节，超长行会被丢弃。
 
 ## 相关源码

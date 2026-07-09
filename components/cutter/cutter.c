@@ -35,14 +35,24 @@ void cutter_gpio_init(void) {
 static bool sw1_locked = false;
 static bool sw2_locked = false;
 static volatile bool cut_sequence_running = false;
+static portMUX_TYPE cut_sequence_mux = portMUX_INITIALIZER_UNLOCKED;
+static cutter_cut_done_cb_t cut_sequence_done_cb = NULL;
+static void *cut_sequence_done_ctx = NULL;
 
-static bool cutter_try_begin_cut_sequence(void)
+static bool cutter_try_begin_cut_sequence(cutter_cut_done_cb_t done_cb, void *done_ctx)
 {
-    if (cut_sequence_running) {
-        return false;
+    bool started = false;
+
+    portENTER_CRITICAL(&cut_sequence_mux);
+    if (!cut_sequence_running) {
+        cut_sequence_running = true;
+        cut_sequence_done_cb = done_cb;
+        cut_sequence_done_ctx = done_ctx;
+        started = true;
     }
-    cut_sequence_running = true;
-    return true;
+    portEXIT_CRITICAL(&cut_sequence_mux);
+
+    return started;
 }
 
 static void cutter_run_cut_sequence(void)
@@ -58,36 +68,63 @@ static void cutter_run_cut_sequence(void)
     cutter_send_command(K2_PIN, false);
 }
 
+static void cutter_finish_cut_sequence(void)
+{
+    cutter_cut_done_cb_t done_cb = NULL;
+    void *done_ctx = NULL;
+
+    portENTER_CRITICAL(&cut_sequence_mux);
+    done_cb = cut_sequence_done_cb;
+    done_ctx = cut_sequence_done_ctx;
+    cut_sequence_done_cb = NULL;
+    cut_sequence_done_ctx = NULL;
+    cut_sequence_running = false;
+    portEXIT_CRITICAL(&cut_sequence_mux);
+
+    if (done_cb != NULL) {
+        done_cb(done_ctx);
+    }
+}
+
 static void cutter_cut_sequence_task(void *pvParameters)
 {
     (void)pvParameters;
     cutter_run_cut_sequence();
-    cut_sequence_running = false;
+    cutter_finish_cut_sequence();
     vTaskDelete(NULL);
 }
 
-bool cutter_start_cut_sequence_task(void)
+bool cutter_start_cut_sequence_async(cutter_cut_done_cb_t done_cb, void *done_ctx)
 {
-    if (!cutter_try_begin_cut_sequence()) {
+    if (!cutter_try_begin_cut_sequence(done_cb, done_ctx)) {
         return false;
     }
 
     if (xTaskCreate(cutter_cut_sequence_task, "cut_sequence", 2048, NULL, 2, NULL) != pdPASS) {
+        portENTER_CRITICAL(&cut_sequence_mux);
+        cut_sequence_done_cb = NULL;
+        cut_sequence_done_ctx = NULL;
         cut_sequence_running = false;
+        portEXIT_CRITICAL(&cut_sequence_mux);
         return false;
     }
 
     return true;
 }
 
+bool cutter_start_cut_sequence_task(void)
+{
+    return cutter_start_cut_sequence_async(NULL, NULL);
+}
+
 bool cutter_run_cut_sequence_if_idle(void)
 {
-    if (!cutter_try_begin_cut_sequence()) {
+    if (!cutter_try_begin_cut_sequence(NULL, NULL)) {
         return false;
     }
 
     cutter_run_cut_sequence();
-    cut_sequence_running = false;
+    cutter_finish_cut_sequence();
     return true;
 }
 

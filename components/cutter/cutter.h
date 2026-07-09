@@ -15,9 +15,12 @@ typedef struct {
     bool state;    // false 触发
 } cutter_command_t;
 
+typedef void (*cutter_cut_done_cb_t)(void *ctx);
+
 void cutter_gpio_init(void);
 void cutter_task(void *pvParameters);
 void cutter_send_command(int PIN_NUM, bool state);
 bool cutter_start_cut_sequence_task(void);
+bool cutter_start_cut_sequence_async(cutter_cut_done_cb_t done_cb, void *done_ctx);
 bool cutter_run_cut_sequence_if_idle(void);
 
