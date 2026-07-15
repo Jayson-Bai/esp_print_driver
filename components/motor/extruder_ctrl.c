@@ -12,6 +12,7 @@
 #define EXTRUDER_SLICE_US 500         // 每片输出的最大时间(us)，可调
 #define RMT_RESOLUTION_HZ 5000000     // RMT 计时分辨率(Hz)，可调
 #define EXTRUDER_ERR_K 5.0f           // 误差修正增益(1/s)，可调
+#define RMT_MAX_DURATION_TICKS 32767  // RMT duration 字段为 15 bit
 
 static float g_last_abs_mm[2] = {0.0f, 0.0f};
 static float g_target_steps_total[2] = {0.0f, 0.0f};
@@ -34,6 +35,18 @@ typedef struct {
     uint32_t low_ticks;
     uint32_t pulses;
 } rmt_step_payload_t;
+
+static uint32_t rmt_ticks_from_us(uint32_t duration_us)
+{
+    uint64_t ticks = ((uint64_t)duration_us * RMT_RESOLUTION_HZ + 999999ULL) / 1000000ULL;
+    if (ticks < 1ULL) {
+        ticks = 1ULL;
+    }
+    if (ticks > RMT_MAX_DURATION_TICKS) {
+        ticks = RMT_MAX_DURATION_TICKS;
+    }
+    return (uint32_t)ticks;
+}
 
 static size_t rmt_step_encode_cb(const void *data, size_t data_size,
                                  size_t symbols_written, size_t symbols_free,
@@ -144,8 +157,8 @@ static void pulse_steps(int tool_id, motor_dir_t direction, int steps)
             steps_chunk = EXTRUDER_MAX_STEPS;
         }
         rmt_step_payload_t payload = {
-            .high_ticks = delay_us,
-            .low_ticks = delay_us,
+            .high_ticks = rmt_ticks_from_us(delay_us),
+            .low_ticks = rmt_ticks_from_us(delay_us),
             .pulses = (uint32_t)steps_chunk,
         };
         rmt_transmit_config_t tx_cfg = {
