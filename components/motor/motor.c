@@ -5,6 +5,7 @@
 
 
 #include "motor.h"
+#include "extruder_ctrl.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
 #include "esp_err.h"
@@ -953,9 +954,9 @@ void Motor_INI(void)
     float Y = motor2_position_mm();
     motor2_ready = motor2_homed && (Y >= SAFE_SWITCH_HEIGHT_MM);
 
-    // Motor3 / Motor4：只要队列存在（任务已经启动），就认为 ready
-    motor3_ready = (motor3_queue != NULL);
-    motor4_ready = (motor4_queue != NULL);
+    // Motor3 / Motor4 由统一挤出规划器独占；保持原 UI ready 显示语义。
+    motor3_ready = extruder_is_ready(1);
+    motor4_ready = extruder_is_ready(2);
     
     // ESP_LOGI("INIT",
         // "系统初始化完成: M1_ready=%d, M2_ready=%d, M3_ready=%d, M4_ready=%d",

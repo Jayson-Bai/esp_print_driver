@@ -12,6 +12,9 @@
 #include <stdlib.h>
 #include <stdbool.h>
 #include <inttypes.h>
+#include <errno.h>
+#include <limits.h>
+#include <math.h>
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 
@@ -53,13 +56,17 @@ typedef enum {
 
 typedef struct {
     char line[256];
+    int64_t rx_us;
 } uart_line_t;
 
 typedef struct {
     uart_cmd_type_t type;
-    int seq;
+    uint32_t seq;
     int tool_id;
-    float total_mm;
+    /* 累计绝对 E，单位为 10^-6 mm；变量名保留为 total_um 以兼容现有接口。 */
+    int64_t total_um;
+    /* 接收任务读到本行换行符时的 MCU 单调微秒时间。 */
+    int64_t rx_us;
     char event_type[32];
     char arg[96];
 } uart_cmd_t;
@@ -69,12 +76,53 @@ static QueueHandle_t uart_line_queue = NULL;
 static QueueHandle_t uart_event_queue = NULL;
 static volatile uint32_t uart_cmd_drop_count = 0;
 static volatile uint32_t uart_line_drop_count = 0;
+static volatile uint32_t uart_fifo_ovf_count = 0;
+static volatile uint32_t uart_buffer_full_count = 0;
+static volatile uint32_t uart_parse_error_count = 0;
+static volatile uint32_t uart_old_seq_count = 0;
+static volatile uint32_t uart_seq_gap_count = 0;
 
 static portMUX_TYPE g_e_status_mux = portMUX_INITIALIZER_UNLOCKED;
-static int g_last_e_seq = -1;
+static bool g_last_e_valid = false;
+static uint32_t g_last_e_seq = 0;
 static int g_last_e_tool = 0;
-static float g_last_e_abs = 0.0f;
+static int64_t g_last_e_total_um = 0;
 static int64_t g_last_e_us = 0;
+static int64_t g_last_eack_us = 0;
+#define RESET_EVENT_CACHE_DEPTH 8
+static portMUX_TYPE g_reset_event_mux = portMUX_INITIALIZER_UNLOCKED;
+static uint32_t g_reset_event_done_seq[2][RESET_EVENT_CACHE_DEPTH];
+static uint8_t g_reset_event_done_count[2] = {0, 0};
+static uint8_t g_reset_event_done_next[2] = {0, 0};
+
+static bool reset_event_was_completed(int tool_id, uint32_t seq)
+{
+    int index = tool_id - 1;
+    bool completed = false;
+    portENTER_CRITICAL(&g_reset_event_mux);
+    for (uint8_t i = 0; i < g_reset_event_done_count[index]; ++i) {
+        if (g_reset_event_done_seq[index][i] == seq) {
+            completed = true;
+            break;
+        }
+    }
+    portEXIT_CRITICAL(&g_reset_event_mux);
+    return completed;
+}
+
+static void mark_reset_event_completed(int tool_id, uint32_t seq)
+{
+    int index = tool_id - 1;
+    portENTER_CRITICAL(&g_reset_event_mux);
+    uint8_t slot = g_reset_event_done_next[index];
+    g_reset_event_done_seq[index][slot] = seq;
+    g_reset_event_done_next[index] = (uint8_t)((slot + 1U) %
+                                                RESET_EVENT_CACHE_DEPTH);
+    if (g_reset_event_done_count[index] < RESET_EVENT_CACHE_DEPTH) {
+        g_reset_event_done_count[index]++;
+    }
+    portEXIT_CRITICAL(&g_reset_event_mux);
+}
 
 // 初始化 uart0
 void uart0_init(int baud_rate)
@@ -111,40 +159,68 @@ static void trim(char *s)
     }
 }
 
-static bool parse_extrude_cmd(const char *cmd, int *seq, int *tool_id, float *len_mm)
+static bool parse_extrude_cmd(const char *cmd, uint32_t *seq, int *tool_id,
+                              int64_t *total_um)
 {
+    /*
+     * 挤出报文格式：E <uint32序号> <工具号> <累计绝对E(mm)>\n
+     * 此处只完成严格语法检查和定点化；工具号 1/2 的语义由执行层检查。
+     */
     if (!cmd || cmd[0] != 'E' || cmd[1] != ' ') {
         return false;
     }
     cmd += 2;
-    char *end;
+    char *end = NULL;
 
-    *seq = (int)strtol(cmd, &end, 10);
-    if (end == cmd || *end != ' ') return false;
+    errno = 0;
+    unsigned long long seq_value = strtoull(cmd, &end, 10);
+    if (end == cmd || errno == ERANGE || seq_value > UINT32_MAX || *end != ' ') {
+        return false;
+    }
+    *seq = (uint32_t)seq_value;
     cmd = end + 1;
 
-    *tool_id = (int)strtol(cmd, &end, 10);
-    if (end == cmd || *end != ' ') return false;
+    errno = 0;
+    long tool_value = strtol(cmd, &end, 10);
+    if (end == cmd || errno == ERANGE || tool_value < INT_MIN ||
+        tool_value > INT_MAX || *end != ' ') {
+        return false;
+    }
+    *tool_id = (int)tool_value;
     cmd = end + 1;
 
-    *len_mm = strtof(cmd, &end);
-    if (end == cmd) return false;
+    errno = 0;
+    double len_mm = strtod(cmd, &end);
+    if (end == cmd || *end != '\0' || errno == ERANGE || !isfinite(len_mm)) {
+        return false;
+    }
+
+    /* 内部保留到 10^-6 mm；序列化之前已经损失的精度无法在 MCU 侧恢复。 */
+    double scaled_um = len_mm * 1000000.0;
+    if (!isfinite(scaled_um) || scaled_um < -1000000000000.0 ||
+        scaled_um > 1000000000000.0) {
+        return false;
+    }
+    *total_um = llround(scaled_um);
 
     return true;
 }
 
-static bool parse_event_cmd(const char *cmd, int *seq, char *event_type, char *arg)
+static bool parse_event_cmd(const char *cmd, uint32_t *seq, char *event_type, char *arg)
 {
+    /* 通用事件格式：EV <uint32序号> <事件类型> [参数]\n */
     if (!cmd || strncmp(cmd, "EV ", 3) != 0) {
         return false;
     }
     cmd += 3;
-    char *end;
-    long s = strtol(cmd, &end, 10);
-    if (end > cmd && *end == ' ') {
-        *seq = (int)s;
-        cmd = end + 1;
+    char *end = NULL;
+    errno = 0;
+    unsigned long long s = strtoull(cmd, &end, 10);
+    if (end == cmd || *end != ' ' || errno == ERANGE || s > UINT32_MAX) {
+        return false;
     }
+    *seq = (uint32_t)s;
+    cmd = end + 1;
     int i = 0;
     while (*cmd && *cmd != ' ' && i < 31) {
         event_type[i++] = *cmd++;
@@ -172,12 +248,14 @@ static void send_uart_line(const char *line)
     uart0_write((const uint8_t *)line, strlen(line));
 }
 
-static void update_last_e_status(int seq, int tool_id, float total_mm, int64_t mcu_us)
+static void update_last_e_status(uint32_t seq, int tool_id, int64_t total_um,
+                                 int64_t mcu_us)
 {
     portENTER_CRITICAL(&g_e_status_mux);
+    g_last_e_valid = true;
     g_last_e_seq = seq;
     g_last_e_tool = tool_id;
-    g_last_e_abs = total_mm;
+    g_last_e_total_um = total_um;
     g_last_e_us = mcu_us;
     portEXIT_CRITICAL(&g_e_status_mux);
 }
@@ -185,25 +263,29 @@ static void update_last_e_status(int seq, int tool_id, float total_mm, int64_t m
 static void reset_last_e_status(void)
 {
     portENTER_CRITICAL(&g_e_status_mux);
-    g_last_e_seq = -1;
+    g_last_e_valid = false;
+    g_last_e_seq = 0;
     g_last_e_tool = 0;
-    g_last_e_abs = 0.0f;
+    g_last_e_total_um = 0;
     g_last_e_us = 0;
+    g_last_eack_us = 0;
     portEXIT_CRITICAL(&g_e_status_mux);
 }
 
-static void get_last_e_status(int *seq, int *tool_id, float *total_mm, int64_t *mcu_us)
+static void get_last_e_status(bool *valid, uint32_t *seq, int *tool_id,
+                              int64_t *total_um, int64_t *mcu_us)
 {
     portENTER_CRITICAL(&g_e_status_mux);
+    *valid = g_last_e_valid;
     *seq = g_last_e_seq;
     *tool_id = g_last_e_tool;
-    *total_mm = g_last_e_abs;
+    *total_um = g_last_e_total_um;
     *mcu_us = g_last_e_us;
     portEXIT_CRITICAL(&g_e_status_mux);
 }
 
 typedef struct {
-    int seq;
+    uint32_t seq;
     char event_type[32];
     bool active;
 } cut_event_done_ctx_t;
@@ -218,7 +300,7 @@ static void clear_cut_event_done_context(void)
     portEXIT_CRITICAL(&g_cut_event_done_mux);
 }
 
-static void prepare_cut_event_done_context(int seq, const char *event_type)
+static void prepare_cut_event_done_context(uint32_t seq, const char *event_type)
 {
     (void)event_type;
 
@@ -252,14 +334,14 @@ static void cut_event_done_callback(void *ctx)
 
     char done_msg[96];
     int64_t done_us = esp_timer_get_time();
-    int done_len = snprintf(done_msg, sizeof(done_msg), "EVDONE %d %s done %" PRId64 "\n",
+    int done_len = snprintf(done_msg, sizeof(done_msg), "EVDONE %" PRIu32 " %s done %" PRId64 "\n",
                             done_ctx.seq, done_ctx.event_type, done_us);
     if (done_len > 0) {
         send_uart_line(done_msg);
     }
 }
 
-static void handle_event(int seq, const char *event_type, const char *arg)
+static void handle_event(uint32_t seq, const char *event_type, const char *arg)
 {
     if (!event_type || !arg) {
         return;
@@ -267,7 +349,7 @@ static void handle_event(int seq, const char *event_type, const char *arg)
 
     char ack[96];
     int64_t ack_us = esp_timer_get_time();
-    int ack_len = snprintf(ack, sizeof(ack), "EVACK %d %s accepted %" PRId64 "\n",
+    int ack_len = snprintf(ack, sizeof(ack), "EVACK %" PRIu32 " %s accepted %" PRId64 "\n",
                            seq, event_type, ack_us);
     if (ack_len > 0) {
         send_uart_line(ack);
@@ -310,7 +392,7 @@ static void handle_event(int seq, const char *event_type, const char *arg)
             char err_msg[96];
             int64_t err_us = esp_timer_get_time();
             int err_len = snprintf(err_msg, sizeof(err_msg),
-                                   "EVERR %d %s busy %" PRId64 "\n",
+                                   "EVERR %" PRIu32 " %s busy %" PRId64 "\n",
                                    seq, event_type, err_us);
             if (err_len > 0) {
                 send_uart_line(err_msg);
@@ -325,14 +407,34 @@ static void handle_event(int seq, const char *event_type, const char *arg)
             char err_msg[96];
             int64_t err_us = esp_timer_get_time();
             int err_len = snprintf(err_msg, sizeof(err_msg),
-                                   "EVERR %d %s invalid_tool %d %" PRId64 "\n",
+                                   "EVERR %" PRIu32 " %s invalid_tool %d %" PRId64 "\n",
                                    seq, event_type, tool_id, err_us);
             if (err_len > 0) {
                 send_uart_line(err_msg);
             }
             return;
         }
-        extruder_reset_absolute(tool_id);
+        /*
+         * 当前上位机对所有非切割事件都使用 event_seq == 0。因此只有非零事件号
+         * 才能安全地作为重放去重标识；若对 0 也去重，之后同一工具的合法复位会被误吞。
+         */
+        if (seq != 0 && reset_event_was_completed(tool_id, seq)) {
+            goto done;
+        }
+        if (!extruder_reset_absolute_wait(tool_id, 150)) {
+            char err_msg[112];
+            int64_t err_us = esp_timer_get_time();
+            int err_len = snprintf(err_msg, sizeof(err_msg),
+                                   "EVERR %" PRIu32 " %s reset_timeout %" PRId64 "\n",
+                                   seq, event_type, err_us);
+            if (err_len > 0) {
+                send_uart_line(err_msg);
+            }
+            return;
+        }
+        if (seq != 0) {
+            mark_reset_event_completed(tool_id, seq);
+        }
         reset_last_e_status();
         goto done;
     }
@@ -343,7 +445,7 @@ static void handle_event(int seq, const char *event_type, const char *arg)
             char err_msg[96];
             int64_t err_us = esp_timer_get_time();
             int err_len = snprintf(err_msg, sizeof(err_msg),
-                                   "EVERR %d %s invalid_args %" PRId64 "\n",
+                                   "EVERR %" PRIu32 " %s invalid_args %" PRId64 "\n",
                                    seq, event_type, err_us);
             if (err_len > 0) {
                 send_uart_line(err_msg);
@@ -360,7 +462,7 @@ static void handle_event(int seq, const char *event_type, const char *arg)
             char err_msg[96];
             int64_t err_us = esp_timer_get_time();
             int err_len = snprintf(err_msg, sizeof(err_msg),
-                                   "EVERR %d %s invalid_args %" PRId64 "\n",
+                                   "EVERR %" PRIu32 " %s invalid_args %" PRId64 "\n",
                                    seq, event_type, err_us);
             if (err_len > 0) {
                 send_uart_line(err_msg);
@@ -375,7 +477,7 @@ static void handle_event(int seq, const char *event_type, const char *arg)
         char err_msg[96];
         int64_t err_us = esp_timer_get_time();
         int err_len = snprintf(err_msg, sizeof(err_msg),
-                               "EVERR %d %s unknown_event %" PRId64 "\n",
+                               "EVERR %" PRIu32 " %s unknown_event %" PRId64 "\n",
                                seq, event_type, err_us);
         if (err_len > 0) {
             send_uart_line(err_msg);
@@ -387,7 +489,7 @@ done:
     {
         char done_msg[96];
         int64_t done_us = esp_timer_get_time();
-        int done_len = snprintf(done_msg, sizeof(done_msg), "EVDONE %d %s done %" PRId64 "\n",
+        int done_len = snprintf(done_msg, sizeof(done_msg), "EVDONE %" PRIu32 " %s done %" PRId64 "\n",
                                 seq, event_type, done_us);
         if (done_len > 0) {
             send_uart_line(done_msg);
@@ -395,52 +497,67 @@ done:
     }
 }
 
-static void handle_extrude_cmd(int seq, int tool_id, float total_mm)
+static void handle_extrude_cmd(uint32_t seq, int tool_id, int64_t total_um,
+                               int64_t rx_us)
 {
     if (tool_id != 1 && tool_id != 2) {
+        uart_parse_error_count++;
         return;
     }
 
-    int last_seq;
+    bool last_valid;
+    uint32_t last_seq;
     int last_tool;
-    float last_abs;
+    int64_t last_total_um;
     int64_t last_us;
-    get_last_e_status(&last_seq, &last_tool, &last_abs, &last_us);
+    get_last_e_status(&last_valid, &last_seq, &last_tool, &last_total_um, &last_us);
+    (void)last_tool;
+    (void)last_total_um;
+    (void)last_us;
 
-    if (last_seq >= 0 && seq <= last_seq) {
-        char warn[96];
-        int len = snprintf(warn, sizeof(warn), "EWARN old_seq=%d last_e_seq=%d\n",
-                           seq, last_seq);
-        if (len > 0) {
-            send_uart_line(warn);
+    if (last_valid) {
+        uint32_t seq_delta = seq - last_seq;
+        if (seq_delta == 0) {
+            uart_old_seq_count++;
+        } else if (seq_delta > (UINT32_MAX / 2U)) {
+            uart_old_seq_count++;
+        } else if (seq_delta > 1U) {
+            uint32_t missed = seq_delta - 1U;
+            if (UINT32_MAX - uart_seq_gap_count < missed) {
+                uart_seq_gap_count = UINT32_MAX;
+            } else {
+                uart_seq_gap_count += missed;
+            }
         }
+    }
+
+    /*
+     * seq 在这里刻意只用于估速和诊断，不作为拒收门禁。现有上位机可能对 E 去重、
+     * 暂停发送、复用轨迹序号或跳号恢复；真正的执行依据始终是累计绝对 E 和 MCU
+     * 本地运动规划。只要之后还有绝对 E，新报文可覆盖中间丢包；若最后一个 E
+     * 永久丢失且没有后续报文，则固件无法知道缺失的最终目标。
+     */
+    if (!extruder_set_absolute_um_at(tool_id, total_um, seq, rx_us)) {
         return;
     }
-
-    if (last_seq >= 0 && seq > last_seq + 1) {
-        char warn[112];
-        int len = snprintf(warn, sizeof(warn),
-                           "EWARN gap expected=%d got=%d last_e_seq=%d\n",
-                           last_seq + 1, seq, last_seq);
-        if (len > 0) {
-            send_uart_line(warn);
-        }
-    }
-
-    extruder_set_absolute(tool_id, total_mm);
 
     int64_t mcu_us = esp_timer_get_time();
-    update_last_e_status(seq, tool_id, total_mm, mcu_us);
+    update_last_e_status(seq, tool_id, total_um, rx_us);
 
-    char ack[96];
-    int len = snprintf(ack, sizeof(ack), "EACK %d %d %.3f %" PRId64 "\n",
-                       seq, tool_id, total_mm, mcu_us);
-    if (len > 0) {
-        send_uart_line(ack);
+    /* EACK 最多约 20 Hz，用于观测而非逐包闭环；电机执行不等待上位机反馈。 */
+    if (g_last_eack_us == 0 || mcu_us - g_last_eack_us >= 50000) {
+        char ack[112];
+        int len = snprintf(ack, sizeof(ack),
+                           "EACK %" PRIu32 " %d %.6f %" PRId64 "\n",
+                           seq, tool_id, (double)total_um / 1000000.0, mcu_us);
+        if (len > 0) {
+            send_uart_line(ack);
+            g_last_eack_us = mcu_us;
+        }
     }
 }
 
-static void handle_line(char *cmd)
+static void handle_line(char *cmd, int64_t rx_us)
 {
     if (!cmd) {
         return;
@@ -458,21 +575,26 @@ static void handle_line(char *cmd)
     uart_cmd_t msg;
     memset(&msg, 0, sizeof(msg));
 
-    if (parse_extrude_cmd(cmd, &msg.seq, &msg.tool_id, &msg.total_mm)) {
+    if (parse_extrude_cmd(cmd, &msg.seq, &msg.tool_id, &msg.total_um)) {
         msg.type = UART_CMD_EXTRUDE;
-        if (xQueueSend(uart_cmd_queue, &msg, portMAX_DELAY) != pdTRUE) {
+        msg.rx_us = rx_us;
+        if (xQueueSend(uart_cmd_queue, &msg, 0) != pdTRUE) {
             uart_cmd_drop_count++;
+            extruder_notify_transport_fault(EXTRUDER_FAULT_CMD_QUEUE_FULL);
         }
         return;
     }
 
     if (parse_event_cmd(cmd, &msg.seq, msg.event_type, msg.arg)) {
         msg.type = UART_CMD_EVENT;
-        if (xQueueSend(uart_cmd_queue, &msg, portMAX_DELAY) != pdTRUE) {
+        if (xQueueSend(uart_cmd_queue, &msg, 0) != pdTRUE) {
             uart_cmd_drop_count++;
+            extruder_notify_transport_fault(EXTRUDER_FAULT_CMD_QUEUE_FULL);
         }
         return;
     }
+
+    uart_parse_error_count++;
 }
 
 int get_current_tool_id(void)
@@ -518,11 +640,16 @@ void serial_rx_task(void *pvParameters)
                             }
                             memcpy(msg.line, line_buf, copy_len);
                             msg.line[copy_len] = '\0';
+                            /* 以完整行到达时刻估速，避免解析/调度排队时间污染 4 ms 周期。 */
+                            msg.rx_us = esp_timer_get_time();
                             if (uart_line_queue != NULL) {
-                                if (xQueueSend(uart_line_queue, &msg, portMAX_DELAY) != pdTRUE) {
+                                if (xQueueSend(uart_line_queue, &msg, 0) != pdTRUE) {
                                     uart_line_drop_count++;
+                                    extruder_notify_transport_fault(EXTRUDER_FAULT_LINE_QUEUE_FULL);
                                 }
                             }
+                        } else if (overflow) {
+                            uart_parse_error_count++;
                         }
                         line_len = 0;
                         overflow = false;
@@ -542,6 +669,17 @@ void serial_rx_task(void *pvParameters)
         }
 
         if (event.type == UART_FIFO_OVF || event.type == UART_BUFFER_FULL) {
+            /*
+             * 溢出后输入流的行边界已不可信，因此清空接收侧并记录本地故障。
+             * 固件不会等待上位机确认，也不会把未知的缺失 E 自行臆测为新目标。
+             */
+            if (event.type == UART_FIFO_OVF) {
+                uart_fifo_ovf_count++;
+                extruder_notify_transport_fault(EXTRUDER_FAULT_UART_FIFO_OVF);
+            } else {
+                uart_buffer_full_count++;
+                extruder_notify_transport_fault(EXTRUDER_FAULT_UART_BUFFER_FULL);
+            }
             uart_flush_input(UART_PORT);
             uart_event_t dummy;
             while (xQueueReceive(uart_event_queue, &dummy, 0) == pdTRUE);
@@ -559,7 +697,7 @@ void serial_parse_task(void *pvParameters)
     uart_line_t msg;
     while (1) {
         if (xQueueReceive(uart_line_queue, &msg, portMAX_DELAY) == pdTRUE) {
-            handle_line(msg.line);
+            handle_line(msg.line, msg.rx_us);
         }
     }
 }
@@ -572,7 +710,7 @@ static void command_dispatch_task(void *pvParameters)
     while (1) {
         if (xQueueReceive(uart_cmd_queue, &msg, portMAX_DELAY) == pdTRUE) {
             if (msg.type == UART_CMD_EXTRUDE) {
-                handle_extrude_cmd(msg.seq, msg.tool_id, msg.total_mm);
+                handle_extrude_cmd(msg.seq, msg.tool_id, msg.total_um, msg.rx_us);
             } else if (msg.type == UART_CMD_EVENT) {
                 handle_event(msg.seq, msg.event_type, msg.arg);
             }
@@ -600,11 +738,42 @@ void serial_tasks_start(void)
     xTaskCreatePinnedToCore(serial_parse_task, "serial_parse", 4096, NULL, 6, NULL, 1);
 }
 
+static const char *extruder_state_name(extruder_state_t state)
+{
+    switch (state) {
+        case EXTRUDER_STATE_IDLE:        return "IDLE";
+        case EXTRUDER_STATE_ENABLE_WAIT: return "ENABLE_WAIT";
+        case EXTRUDER_STATE_ACCEL:       return "ACCEL";
+        case EXTRUDER_STATE_RUN:         return "RUN";
+        case EXTRUDER_STATE_DECEL:       return "DECEL";
+        case EXTRUDER_STATE_DIR_CHANGE:  return "DIR_CHANGE";
+        case EXTRUDER_STATE_HOLD:        return "HOLD";
+        case EXTRUDER_STATE_FAULT:       return "FAULT";
+        case EXTRUDER_STATE_RESETTING:   return "RESETTING";
+        default:                         return "UNKNOWN";
+    }
+}
+
+static void send_status_buffer(char *buf, size_t capacity, int formatted_len)
+{
+    if (buf == NULL || capacity < 2 || formatted_len <= 0) {
+        return;
+    }
+
+    size_t send_len = (size_t)formatted_len;
+    if (send_len >= capacity) {
+        buf[capacity - 2] = '\n';
+        buf[capacity - 1] = '\0';
+        send_len = capacity - 1;
+    }
+    uart0_write((const uint8_t *)buf, (int)send_len);
+}
+
 static void status_task(void *pvParameters)
 {
     (void)pvParameters;
 
-    char buf[256];
+    char buf[512];
     TickType_t last_wake = xTaskGetTickCount();
 
     while (1) {
@@ -630,25 +799,76 @@ static void status_task(void *pvParameters)
             tool = 0;
         }
 
-        int last_seq;
+        bool last_valid;
+        uint32_t last_seq;
         int last_tool;
-        float last_abs;
+        int64_t last_total_um;
         int64_t last_us;
-        get_last_e_status(&last_seq, &last_tool, &last_abs, &last_us);
+        get_last_e_status(&last_valid, &last_seq, &last_tool, &last_total_um, &last_us);
 
+        char last_seq_text[16];
+        if (last_valid) {
+            snprintf(last_seq_text, sizeof(last_seq_text), "%" PRIu32, last_seq);
+        } else {
+            memcpy(last_seq_text, "-1", 3);
+        }
+
+        /* STAT 保持原有 UI 状态格式；last_e_abs 仍以 mm 输出。 */
         int len = snprintf(buf, sizeof(buf),
                            "STAT temp_cf=%.1f temp_resin=%.1f target_cf=%.1f target_resin=%.1f "
                            "fan_ok_cf=%d fan_ok_resin=%d tool=%d err=%d "
-                           "last_e_seq=%d last_e_tool=%d last_e_abs=%.3f last_e_us=%" PRId64 "\n",
+                           "last_e_seq=%s last_e_tool=%d last_e_abs=%.6f last_e_us=%" PRId64 "\n",
                            temp_cf, temp_resin, target_cf, target_resin,
                            fan_ok_cf, fan_ok_resin, tool, err,
-                           last_seq, last_tool, last_abs, last_us);
-        if (len > 0) {
-            if (len > (int)sizeof(buf)) {
-                len = sizeof(buf);
-            }
-            uart0_write((const uint8_t *)buf, len);
+                           last_seq_text, last_tool,
+                           (double)last_total_um / 1000000.0, last_us);
+        send_status_buffer(buf, sizeof(buf), len);
+
+        int status_tool = g_current_tool_id;
+        if (status_tool != 1 && status_tool != 2) {
+            status_tool = 1;
         }
+        extruder_status_t e_status;
+        memset(&e_status, 0, sizeof(e_status));
+        /* ESTAT 是 MCU 本地规划/脉冲账本快照，仅用于监测，不构成执行握手。 */
+        if (extruder_get_status(status_tool, &e_status)) {
+            len = snprintf(buf, sizeof(buf),
+                           "ESTAT tool=%d state=%s target_steps=%" PRId64
+                           " submitted_steps=%" PRId64 " completed_steps=%" PRId64
+                           " host_total_um=%" PRId64 " last_cmd_us=%" PRId64
+                           " ff_until_us=%" PRId64 " ff_sps=%.3f v_sps=%.3f"
+                           " phase=%.6f last_seq=%" PRIu32
+                           " fault=0x%08" PRIx32 " hard_fault=0x%08" PRIx32
+                           " rmt_submit_err=%" PRIu32
+                           " rmt_done_err=%" PRIu32 " qdepth=%" PRIu32
+                           " dir=%d enabled=%d hold_latched=%d host_valid=%d\n",
+                           status_tool, extruder_state_name(e_status.state),
+                           e_status.target_steps, e_status.submitted_steps,
+                           e_status.completed_steps, e_status.host_total_um,
+                           e_status.last_command_us,
+                           e_status.feedforward_valid_until_us,
+                           e_status.feedforward_steps_s,
+                           e_status.velocity_steps_s, e_status.phase, e_status.last_seq,
+                           e_status.fault_flags, e_status.hard_fault_flags,
+                           e_status.rmt_submit_errors,
+                           e_status.rmt_done_errors, e_status.queue_depth,
+                           e_status.direction_sign, e_status.enabled ? 1 : 0,
+                           e_status.host_hold_active ? 1 : 0,
+                           e_status.host_sample_valid ? 1 : 0);
+            send_status_buffer(buf, sizeof(buf), len);
+        }
+
+        /* USTAT 汇总 UART 与软件队列异常，便于无逻辑分析仪时定位链路丢包。 */
+        len = snprintf(buf, sizeof(buf),
+                       "USTAT fifo_ovf=%" PRIu32 " buffer_full=%" PRIu32
+                       " line_drop=%" PRIu32 " cmd_drop=%" PRIu32
+                       " old_seq=%" PRIu32 " seq_gap=%" PRIu32
+                       " parse_err=%" PRIu32 "\n",
+                       uart_fifo_ovf_count, uart_buffer_full_count,
+                       uart_line_drop_count, uart_cmd_drop_count,
+                       uart_old_seq_count, uart_seq_gap_count,
+                       uart_parse_error_count);
+        send_status_buffer(buf, sizeof(buf), len);
 
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(1000));
     }

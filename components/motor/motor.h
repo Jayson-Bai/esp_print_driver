@@ -27,7 +27,11 @@
 // 转速
 #define STEP_DELAY_US  75   // 微秒 (1 毫秒 = 1000 微秒)  
 
-//微步
+/*
+ * 软件侧步数换算使用的细分值，必须与驱动板实际细分一致。
+ * TMC2209 独立模式下，M3/M4 的 16 微步要求 MS1、MS2 均接 VCC_IO；
+ * 本固件当前不会通过 TMC2209 UART 自动写入 MRES。
+ */
 #define motor1_microstep 8
 #define motor2_microstep 8
 #define motor3_microstep 16
@@ -138,7 +142,6 @@ void motor_move_to_mm(motor_id_t motor_id, float target_mm);
 void motor_homing(motor_id_t motor_id);
 void motor_position(motor_id_t motor_id);
 void motor_move_to_mm_impl(motor_id_t motor_id, float target_mm);
-
 
 
 

@@ -63,11 +63,11 @@ void PID2_Task(void *pvParameters);
 void cutter_task(void *pvParameters);
 void fan_task(void *pvParameters);
 
-TaskHandle_t motor3_task_handle = NULL;
-TaskHandle_t motor4_task_handle = NULL;
-
 void app_main() {
     uart0_init(115200);
+
+    // STEP/DIR/EN 由统一的挤出规划器独占；先于串口任务启动。
+    extruder_task_start();
 
     //温度采样后台任务
     temperature_task_start();
@@ -83,12 +83,6 @@ void app_main() {
     xTaskCreatePinnedToCore(motor2_task, "motor2_ctrl",   4096,   NULL,   5,    NULL,   1);
 
     vTaskDelay(pdMS_TO_TICKS(200));
-
-    xTaskCreatePinnedToCore(motor3_task, "motor3_ctrl",   4096,   NULL,   5,    &motor3_task_handle,   1);
-
-    xTaskCreatePinnedToCore(motor4_task, "motor4_ctrl",   4096,   NULL,   5,    &motor4_task_handle,   1);
-
-    extruder_task_start();
 
     //电机限位任务
     xTaskCreatePinnedToCore(stop_monitor_task, "motor_stop",   4096,   NULL,   5,    NULL,   1);

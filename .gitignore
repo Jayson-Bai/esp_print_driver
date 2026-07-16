@@ -9,3 +9,10 @@ sdkconfig.old
 
 # Local requirement/response notes
 docs/**/*.md
+
+# Versioned phase-1 extrusion contracts and verification plan
+!docs/需求文档/挤出控制第一阶段固件说明.md
+!docs/需求文档/上位机挤出接口要求_第一阶段.md
+!docs/需求文档/挤出控制第一阶段测试计划.md
+!docs/需求文档/上位机挤出发送优化建议_后续.md
+!docs/需求文档/挤出控制第一阶段验收边界与测试结论.md
