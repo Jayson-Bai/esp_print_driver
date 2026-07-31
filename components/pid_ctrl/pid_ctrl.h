@@ -115,6 +115,8 @@ esp_err_t pid_reset_ctrl_block(pid_ctrl_block_handle_t pid);
 // ledc.h
 #define HEATER_PIN_1    3        //纤维PWM引脚
 #define HEATER_PIN_2    46       //树脂PWM引脚
+#define HEATER_OFF_LEVEL 0       //加热MOS关闭电平
+#define HEATER_MAX_TEMPERATURE_C 300.0f //温度超过该值时强制关闭对应加热
 #define PWM_CHANNEL_1      LEDC_CHANNEL_0      //纤维通道
 #define PWM_CHANNEL_2      LEDC_CHANNEL_1      //树脂通道
 #define LEDC_RESOLUTION   LEDC_TIMER_12_BIT     // 4096(1 << **)

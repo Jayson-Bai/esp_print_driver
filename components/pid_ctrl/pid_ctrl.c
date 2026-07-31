@@ -166,7 +166,7 @@ void PWM1_init()
     };
     gpio_config(&io_conf);
     // 初始拉低，避免误触发
-    gpio_set_level(HEATER_PIN_1, 0);
+    gpio_set_level(HEATER_PIN_1, HEATER_OFF_LEVEL);
 
 
     //timber初始化，两通道可共用
@@ -238,7 +238,7 @@ void PWM2_init()
     };
     gpio_config(&io_conf);
     // 初始拉低，避免误触发
-    gpio_set_level(HEATER_PIN_2, 0);
+    gpio_set_level(HEATER_PIN_2, HEATER_OFF_LEVEL);
 
     //timber初始化，两通道可共用
     ledc_timer_config_t timer_cfg = 
@@ -393,12 +393,58 @@ esp_err_t pid_control_pwm_duty(
 QueueHandle_t PID1_queue = NULL;
 
 extern float get_temperature1();
+extern float get_temperature2();
 
 static portMUX_TYPE g_pid_spinlock = portMUX_INITIALIZER_UNLOCKED;
 static volatile float g_pid_target_cf = 0.0f;
 static volatile float g_pid_target_resin = 0.0f;
 static volatile bool g_pid_enable_cf = false;
 static volatile bool g_pid_enable_resin = false;
+
+static bool heater_temperature_is_over_limit(int channel, float *temperature)
+{
+    float current;
+
+    if (channel == 1) {
+        current = get_temperature1();
+    } else if (channel == 2) {
+        current = get_temperature2();
+    } else {
+        return false;
+    }
+
+    if (temperature != NULL) {
+        *temperature = current;
+    }
+    return current > HEATER_MAX_TEMPERATURE_C;
+}
+
+static void heater_mark_disabled(int channel)
+{
+    portENTER_CRITICAL(&g_pid_spinlock);
+    if (channel == 1) {
+        g_pid_target_cf = 0.0f;
+        g_pid_enable_cf = false;
+    } else if (channel == 2) {
+        g_pid_target_resin = 0.0f;
+        g_pid_enable_resin = false;
+    }
+    portEXIT_CRITICAL(&g_pid_spinlock);
+}
+
+/*
+ * 停止LEDC并把输出固定为低电平。与仅把占空比设为0相比，
+ * ledc_stop()会关闭PWM信号输出并明确设置空闲电平。
+ */
+static void heater_force_off(int channel, ledc_channel_t pwm_channel)
+{
+    esp_err_t err = ledc_stop(LEDC_LOW_SPEED_MODE, pwm_channel, HEATER_OFF_LEVEL);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to force heater %d output LOW: %s",
+                 channel, esp_err_to_name(err));
+    }
+    heater_mark_disabled(channel);
+}
 
 static pid_ctrl_parameter_t g_pid_params_cf = {
     .kp = 2.0f, .ki = 0.85f, .kd = 40.0f,
@@ -434,8 +480,7 @@ void PID1_Task(void *pvParameters) {
 
             if (!cmd.enable) 
             {
-                ledc_set_duty(LEDC_LOW_SPEED_MODE, PWM_CHANNEL_1, 0);
-                ledc_update_duty(LEDC_LOW_SPEED_MODE, PWM_CHANNEL_1);
+                heater_force_off(1, PWM_CHANNEL_1);
                 continue;
             }
 
@@ -453,6 +498,17 @@ void PID1_Task(void *pvParameters) {
 
                 current = get_temperature1();
 
+                if (current > HEATER_MAX_TEMPERATURE_C) {
+                    heater_force_off(1, PWM_CHANNEL_1);
+                    ESP_LOGE(TAG,
+                             "Heater 1 overtemperature: %.1f C > %.1f C; output forced LOW",
+                             current, HEATER_MAX_TEMPERATURE_C);
+                    if (pid != NULL) {
+                        pid_reset_ctrl_block(pid);
+                    }
+                    break;
+                }
+
                 pid_control_pwm_duty(&pid,
                                      &local_params,
                                      target_temp,
@@ -465,8 +521,7 @@ void PID1_Task(void *pvParameters) {
                 PID_cmd_t stop_cmd;
                 if (xQueueReceive(PID1_queue, &stop_cmd, 0) == pdTRUE) {
                     if (!stop_cmd.enable) {
-                        ledc_set_duty(LEDC_LOW_SPEED_MODE, PWM_CHANNEL_1, 0);
-                        ledc_update_duty(LEDC_LOW_SPEED_MODE, PWM_CHANNEL_1);
+                        heater_force_off(1, PWM_CHANNEL_1);
                         break;
                     }
                     target_temp = stop_cmd.target_temp;
@@ -482,8 +537,6 @@ void PID1_Task(void *pvParameters) {
 //PID2任务封装
 QueueHandle_t PID2_queue = NULL;
 
-extern float get_temperature2();
-
 void PID2_Task(void *pvParameters) {
 
     PID2_queue = xQueueCreate(5, sizeof(PID_cmd_t));
@@ -498,8 +551,7 @@ void PID2_Task(void *pvParameters) {
     while (1) {
         if (xQueueReceive(PID2_queue, &cmd, portMAX_DELAY)) {
             if (!cmd.enable) {
-                ledc_set_duty(LEDC_LOW_SPEED_MODE, PWM_CHANNEL_2, 0);
-                ledc_update_duty(LEDC_LOW_SPEED_MODE, PWM_CHANNEL_2);
+                heater_force_off(2, PWM_CHANNEL_2);
                 continue;
             }
 
@@ -516,6 +568,17 @@ void PID2_Task(void *pvParameters) {
 
                 current = get_temperature2();
 
+                if (current > HEATER_MAX_TEMPERATURE_C) {
+                    heater_force_off(2, PWM_CHANNEL_2);
+                    ESP_LOGE(TAG,
+                             "Heater 2 overtemperature: %.1f C > %.1f C; output forced LOW",
+                             current, HEATER_MAX_TEMPERATURE_C);
+                    if (pid != NULL) {
+                        pid_reset_ctrl_block(pid);
+                    }
+                    break;
+                }
+
                 pid_control_pwm_duty(&pid,
                                      &local_params,
                                      target_temp,
@@ -527,8 +590,7 @@ void PID2_Task(void *pvParameters) {
                 PID_cmd_t stop_cmd;
                 if (xQueueReceive(PID2_queue, &stop_cmd, 0) == pdTRUE) {
                     if (!stop_cmd.enable) {
-                        ledc_set_duty(LEDC_LOW_SPEED_MODE, PWM_CHANNEL_2, 0);
-                        ledc_update_duty(LEDC_LOW_SPEED_MODE, PWM_CHANNEL_2);
+                        heater_force_off(2, PWM_CHANNEL_2);
                         break;
                     }
                     target_temp = stop_cmd.target_temp;
@@ -544,6 +606,15 @@ void PID2_Task(void *pvParameters) {
 
 void PID_send_command(int channel, float target_temp, bool enable) //1纤维 2树脂
 {
+    float current_temp;
+    if (enable && heater_temperature_is_over_limit(channel, &current_temp)) {
+        ESP_LOGE(TAG,
+                 "Reject heater %d enable command: %.1f C > %.1f C",
+                 channel, current_temp, HEATER_MAX_TEMPERATURE_C);
+        target_temp = 0.0f;
+        enable = false;
+    }
+
     PID_cmd_t cmd = {
         .target_temp = target_temp,
         .enable = enable,
