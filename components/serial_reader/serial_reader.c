@@ -366,12 +366,32 @@ static void handle_event(uint32_t seq, const char *event_type, const char *arg)
         goto done;
     }
     if (strcmp(event_type, "tool_change_cf") == 0) {
-        switch_to_CF();
+        if (!switch_to_CF()) {
+            char err_msg[96];
+            int64_t err_us = esp_timer_get_time();
+            int err_len = snprintf(err_msg, sizeof(err_msg),
+                                   "EVERR %" PRIu32 " %s switch_failed %" PRId64 "\n",
+                                   seq, event_type, err_us);
+            if (err_len > 0) {
+                send_uart_line(err_msg);
+            }
+            return;
+        }
         g_current_tool_id = 1;
         goto done;
     }
     if (strcmp(event_type, "tool_change_resin") == 0) {
-        switch_to_RESIN();
+        if (!switch_to_RESIN()) {
+            char err_msg[96];
+            int64_t err_us = esp_timer_get_time();
+            int err_len = snprintf(err_msg, sizeof(err_msg),
+                                   "EVERR %" PRIu32 " %s switch_failed %" PRId64 "\n",
+                                   seq, event_type, err_us);
+            if (err_len > 0) {
+                send_uart_line(err_msg);
+            }
+            return;
+        }
         g_current_tool_id = 2;
         goto done;
     }
@@ -824,7 +844,8 @@ static void status_task(void *pvParameters)
                            (double)last_total_um / 1000000.0, last_us);
         send_status_buffer(buf, sizeof(buf), len);
 
-        int status_tool = g_current_tool_id;
+        /* 物理限位优先，确保上电已有工作头或UI切头后状态不会沿用旧值。 */
+        int status_tool = (tool == 1 || tool == 2) ? tool : g_current_tool_id;
         if (status_tool != 1 && status_tool != 2) {
             status_tool = 1;
         }

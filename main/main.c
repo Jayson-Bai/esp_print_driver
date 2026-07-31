@@ -72,11 +72,6 @@ void app_main() {
     //温度采样后台任务
     temperature_task_start();
 
-    //串口接收/解析任务
-    serial_tasks_start();
-    command_dispatch_task_start();
-    status_task_start();
-    
     //纤维轴电机控制任务     （任务函数，     任务名称，       栈大小，  参数， 优先级，任务句柄，核心）
     xTaskCreatePinnedToCore(motor1_task, "motor1_ctrl",   4096,   NULL,   5,    NULL,   1);
 
@@ -84,8 +79,16 @@ void app_main() {
 
     vTaskDelay(pdMS_TO_TICKS(200));
 
+    // 丝杠任务和限位GPIO就绪后，先锁存一次上电初始状态。
+    motor_startup_check();
+
     //电机限位任务
     xTaskCreatePinnedToCore(stop_monitor_task, "motor_stop",   4096,   NULL,   5,    NULL,   1);
+
+    // 上电轴状态确认后再接收外部切头指令，避免启动竞态。
+    serial_tasks_start();
+    command_dispatch_task_start();
+    status_task_start();
 
     //gui常驻任务（非临时栈，需要持续运行）
     xTaskCreatePinnedToCore(guiTask, "gui", 8192*2, NULL, 4, NULL, 0);

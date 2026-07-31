@@ -269,7 +269,7 @@ void ui_event_CalibrationButton(lv_event_t * e)
     lv_event_code_t event_code = lv_event_get_code(e);
 
     if(event_code == LV_EVENT_CLICKED) {
-        Motor_INI();  
+        (void)Motor_INI();
     }
 }
 
@@ -310,9 +310,9 @@ void ui_event_Set1Button(lv_event_t * e)//就位
     lv_event_code_t event_code = lv_event_get_code(e);
 
     if(event_code == LV_EVENT_CLICKED) {
-        _ui_flag_modify(ui_Set2Button, LV_OBJ_FLAG_HIDDEN, _UI_MODIFY_FLAG_ADD);
-
-        motor_position(1);
+        if (switch_to_CF()) {
+            _ui_flag_modify(ui_Set2Button, LV_OBJ_FLAG_HIDDEN, _UI_MODIFY_FLAG_ADD);
+        }
     }
 }
 
@@ -391,9 +391,9 @@ void ui_event_Set2Button(lv_event_t * e)//就位
     lv_event_code_t event_code = lv_event_get_code(e);
 
     if(event_code == LV_EVENT_CLICKED) {
-        _ui_flag_modify(ui_Set1Button, LV_OBJ_FLAG_HIDDEN, _UI_MODIFY_FLAG_ADD);
-
-        motor_position(2);
+        if (switch_to_RESIN()) {
+            _ui_flag_modify(ui_Set1Button, LV_OBJ_FLAG_HIDDEN, _UI_MODIFY_FLAG_ADD);
+        }
     }
 }
 

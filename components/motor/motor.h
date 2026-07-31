@@ -1,7 +1,9 @@
 #pragma once
+#include <stdbool.h>
 #include <stdint.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/task.h"
 #include "esp_rom_sys.h"
 
 // 引脚
@@ -37,13 +39,15 @@
 #define motor3_microstep 16
 #define motor4_microstep 16
 
-#define SAFE_TARGET_MM         70.0f  // 动作目标：抬升到 70mm
-#define SAFE_SWITCH_HEIGHT_MM  60.0f    // 定义安全切换的阈值高度
-#define SWITCH_TIMEOUT_MS      30000    // 超时时间 5000ms (5秒)
-#define HOME_TIMEOUT_MS      30000
-#define CHECK_INTERVAL_MS      20      // 检测间隔 20ms
+#define SAFE_TARGET_MM         60.0f  // 动作目标：抬升到 60mm
+#define SAFE_SWITCH_HEIGHT_MM  60.0f  // 允许另一轴下降的最低安全高度
+#define SWITCH_TIMEOUT_MS      30000  // 下探找限位超时 30秒
+#define HOME_TIMEOUT_MS        30000  // 抬升到安全位置超时 30秒
+#define CHECK_INTERVAL_MS      20     // 检测间隔 20ms
 
-void Motor_INI(void);
+bool Motor_INI(void);
+void motor_startup_check(void);
+bool motor_axes_startup_locked(void);
 
 extern volatile bool motor1_ready;
 extern volatile bool motor2_ready;
@@ -96,6 +100,7 @@ typedef struct {
     uint32_t step_delay_us;
     motor_cmd_type_t cmd_type;
     float   target_mm;  //MOVE_TO_MM / HOMING 用
+    TaskHandle_t completion_task; // 非空时，轴任务完成本条命令后通知调用者
 } motor_cmd_t;
 
 
@@ -133,8 +138,8 @@ float motor1_position_mm(void);
 float motor2_position_mm(void);
 void motor_homing_impl(motor_id_t motor_id);
 void motor_position_impl(motor_id_t motor_id);
-void switch_to_CF(void);
-void switch_to_RESIN(void);
+bool switch_to_CF(void);
+bool switch_to_RESIN(void);
 void extruder_parameters_init(void);
 float get_X_position_mm(void);
 float get_Y_position_mm(void);
@@ -142,6 +147,3 @@ void motor_move_to_mm(motor_id_t motor_id, float target_mm);
 void motor_homing(motor_id_t motor_id);
 void motor_position(motor_id_t motor_id);
 void motor_move_to_mm_impl(motor_id_t motor_id, float target_mm);
-
-
-
