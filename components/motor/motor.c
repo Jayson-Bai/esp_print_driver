@@ -36,9 +36,9 @@ volatile int motor1_position_steps = 0;
 volatile int motor2_position_steps = 0;
 
 /*
- * 上电锁只由第一次限位采样决定：两路都未触发时保持锁定，直到用户
- * 手动把任意一个头移到限位并点击“初始化”。轴序列互斥锁用于避免
- * UI 初始化与串口切头同时操作两根丝杠。
+ * 上电时两路限位均未触发才锁定；锁定期间手动把任意一个头移到限位，
+ * 即建立该轴原点并自动解锁。之后自动切头仍必须先把限位上的头抬到
+ * 安全高度，才能让另一个头下降找限位。轴序列互斥锁用于防止并发动作。
  */
 static volatile bool g_axes_startup_checked = false;
 static volatile bool g_axes_startup_locked = true;
@@ -154,6 +154,20 @@ static void sync_axis_origin_from_limit(motor_id_t motor_id)
     update_axis_ready_flags();
 }
 
+static void release_startup_lock_from_limit(motor_id_t motor_id)
+{
+    if (!g_axes_startup_checked || !g_axes_startup_locked ||
+        !axis_is_at_work_position(motor_id)) {
+        return;
+    }
+
+    /* 先建立可信原点，再开放受双轴安全互锁保护的自动切头。 */
+    sync_axis_origin_from_limit(motor_id);
+    g_axes_startup_locked = false;
+    ESP_LOGI("AXIS", "Startup lock released by Motor%d limit",
+             motor_id == MOTOR1 ? 1 : 2);
+}
+
 // 检查另一个轴是否处于安全位置
 static bool is_other_axis_safe(motor_id_t self_id)
 {
@@ -261,7 +275,7 @@ void motor_startup_check(void)
 
     if (g_axes_startup_locked) {
         ESP_LOGW("AXIS",
-                 "Startup locked: neither head is on its limit; manually move one head to a limit, then press Initialize");
+                 "Startup locked: neither head is on its limit; manually move one head to a limit to unlock");
     } else {
         ESP_LOGI("AXIS", "Startup unlocked: CF_limit=%d RESIN_limit=%d",
                  motor1_at_work, motor2_at_work);
@@ -356,6 +370,14 @@ void stop_monitor_task(void *arg) {
     int last_level_1 = gpio_get_level(STOP_PIN_1);
     int last_level_2 = gpio_get_level(STOP_PIN_2);
 
+    /* 覆盖上电采样与监测任务启动之间恰好触发限位的极小时间窗口。 */
+    if (last_level_1 == 0) {
+        release_startup_lock_from_limit(MOTOR1);
+    }
+    if (last_level_2 == 0) {
+        release_startup_lock_from_limit(MOTOR2);
+    }
+
     while (1) {
         (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(10));
         // ---- MOTOR1 限位检测 ----
@@ -369,6 +391,7 @@ void stop_monitor_task(void *arg) {
             if (motor1_current_dir == CW) {
                 gpio_set_level(EN_PIN_1, 1);  
             }
+            release_startup_lock_from_limit(MOTOR1);
             // ESP_LOGW("STOP", "MOTOR1 限位触发, 禁止继续向下运动");
         }
         last_level_1 = level1;
@@ -384,6 +407,7 @@ void stop_monitor_task(void *arg) {
             if (motor2_current_dir == CW) {
                 gpio_set_level(EN_PIN_2, 1); 
             }
+            release_startup_lock_from_limit(MOTOR2);
             // ESP_LOGW("STOP", "MOTOR2 限位触发, 禁止继续向下运动");
         }
         last_level_2 = level2;
@@ -966,7 +990,7 @@ static bool switch_to_axis(motor_id_t target)
 
     if (g_axes_startup_locked) {
         ESP_LOGW("SWITCH",
-                 "Tool change rejected by startup lock; press Initialize after manually triggering either limit");
+                 "Tool change rejected by startup lock; manually trigger either limit first");
         return false;
     }
     if (!axis_sequence_take()) {

@@ -67,7 +67,6 @@ extern lv_obj_t * ui_CalibrationLable;
 extern lv_obj_t * ui_SettingButton;
 extern lv_obj_t * ui_SettingLable;
 // CUSTOM VARIABLES
-void ui_event_CalibrationButton(lv_event_t * e); //系统初始化
 
 // SCREEN: ui_AxisScreen
 void ui_AxisScreen_screen_init(void);

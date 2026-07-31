@@ -61,7 +61,6 @@ lv_obj_t * ui_CalibrationLable;
 lv_obj_t * ui_SettingButton;
 lv_obj_t * ui_SettingLable;
 // CUSTOM VARIABLES
-void ui_event_CalibrationButton(lv_event_t * e);
 
 // SCREEN: ui_AxisScreen
 void ui_AxisScreen_screen_init(void);
@@ -263,16 +262,6 @@ void ui_event_TempButton(lv_event_t * e)
         _ui_screen_change(&ui_TempScreen, LV_SCR_LOAD_ANIM_NONE, 0, 0, &ui_TempScreen_screen_init);
     }
 }
-
-void ui_event_CalibrationButton(lv_event_t * e)
-{
-    lv_event_code_t event_code = lv_event_get_code(e);
-
-    if(event_code == LV_EVENT_CLICKED) {
-        (void)Motor_INI();
-    }
-}
-
 
 void ui_event_CutButton(lv_event_t * e)
 {

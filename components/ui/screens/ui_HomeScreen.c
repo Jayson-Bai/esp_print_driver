@@ -445,7 +445,6 @@ void ui_HomeScreen_screen_init(void)
     lv_obj_add_event_cb(ui_AxisButton, ui_event_AxisButton, LV_EVENT_ALL, NULL);
     lv_obj_add_event_cb(ui_TempButton, ui_event_TempButton, LV_EVENT_ALL, NULL);
 
-    lv_obj_add_event_cb(ui_CalibrationButton, ui_event_CalibrationButton, LV_EVENT_ALL, NULL); //初始化
 
 
 }
