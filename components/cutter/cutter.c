@@ -61,9 +61,9 @@ static void cutter_run_cut_sequence(void)
     vTaskDelay(pdMS_TO_TICKS(7000));
 
     gpio_set_level(CUT_PIN, 1);
-    vTaskDelay(pdMS_TO_TICKS(2000));
-    gpio_set_level(CUT_PIN, 0);
     vTaskDelay(pdMS_TO_TICKS(1000));
+    gpio_set_level(CUT_PIN, 0);
+    vTaskDelay(pdMS_TO_TICKS(500));
 
     cutter_send_command(K2_PIN, false);
 }
