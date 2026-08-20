@@ -138,7 +138,7 @@ static void update_axis_ready_flags(void)
 
 static void sync_axis_origin_from_limit(motor_id_t motor_id)
 {
-    if (!axis_is_at_work_position(motor_id)) {
+    if (!axis_limit_stably_active(motor_id)) {
         return;
     }
 
@@ -157,7 +157,7 @@ static void sync_axis_origin_from_limit(motor_id_t motor_id)
 static void release_startup_lock_from_limit(motor_id_t motor_id)
 {
     if (!g_axes_startup_checked || !g_axes_startup_locked ||
-        !axis_is_at_work_position(motor_id)) {
+        !axis_limit_stably_active(motor_id)) {
         return;
     }
 
@@ -309,35 +309,15 @@ static void axis_sequence_give(void)
 }
 
 static TaskHandle_t g_stop_task_handle = NULL;
-static volatile int64_t g_stop1_last_isr_us = 0;
-static volatile int64_t g_stop2_last_isr_us = 0;
-#define STOP_DEBOUNCE_US 3000
 
 static void IRAM_ATTR stop_gpio_isr_handler(void *arg)
 {
-    int pin = (int)(intptr_t)arg;
-    int64_t now_us = esp_timer_get_time();
+    (void)arg;
 
-    if (pin == STOP_PIN_1) {
-        if (now_us - g_stop1_last_isr_us < STOP_DEBOUNCE_US) {
-            return;
-        }
-        g_stop1_last_isr_us = now_us;
-        if (motor1_current_dir == CW) {
-            limit_triggered_1 = true;
-            gpio_set_level(EN_PIN_1, 1);
-        }
-    } else if (pin == STOP_PIN_2) {
-        if (now_us - g_stop2_last_isr_us < STOP_DEBOUNCE_US) {
-            return;
-        }
-        g_stop2_last_isr_us = now_us;
-        if (motor2_current_dir == CW) {
-            limit_triggered_2 = true;
-            gpio_set_level(EN_PIN_2, 1);
-        }
-    }
-
+    /*
+     * ISR 只负责唤醒任务。GPIO 毛刺不能在这里关闭驱动或建立原点；
+     * 真实限位由任务上下文中的稳定采样确认。
+     */
     if (g_stop_task_handle != NULL) {
         BaseType_t higher_woken = pdFALSE;
         vTaskNotifyGiveFromISR(g_stop_task_handle, &higher_woken);
@@ -371,10 +351,10 @@ void stop_monitor_task(void *arg) {
     int last_level_2 = gpio_get_level(STOP_PIN_2);
 
     /* 覆盖上电采样与监测任务启动之间恰好触发限位的极小时间窗口。 */
-    if (last_level_1 == 0) {
+    if (last_level_1 == 0 && axis_limit_stably_active(MOTOR1)) {
         release_startup_lock_from_limit(MOTOR1);
     }
-    if (last_level_2 == 0) {
+    if (last_level_2 == 0 && axis_limit_stably_active(MOTOR2)) {
         release_startup_lock_from_limit(MOTOR2);
     }
 
@@ -383,12 +363,13 @@ void stop_monitor_task(void *arg) {
         // ---- MOTOR1 限位检测 ----
         int level1 = gpio_get_level(STOP_PIN_1);
 
-        if (last_level_1 == 1 && level1 == 0) {  // 下降沿触发
-            limit_triggered_1 = true;
-            motor1_position_steps = 0;
-            motor1_homed = true;
-            motor1_ready = true;
+        if (last_level_1 == 1 && level1 == 0 &&
+            axis_limit_stably_active(MOTOR1)) {
             if (motor1_current_dir == CW) {
+                limit_triggered_1 = true;
+                motor1_position_steps = 0;
+                motor1_homed = true;
+                motor1_ready = true;
                 gpio_set_level(EN_PIN_1, 1);  
             }
             release_startup_lock_from_limit(MOTOR1);
@@ -399,12 +380,13 @@ void stop_monitor_task(void *arg) {
         // ---- MOTOR2 限位检测 ----
         int level2 = gpio_get_level(STOP_PIN_2);
 
-        if (last_level_2 == 1 && level2 == 0) {  // 下降沿触发
-            limit_triggered_2 = true;
-            motor2_position_steps = 0;
-            motor2_homed = true;
-            motor2_ready = true;
+        if (last_level_2 == 1 && level2 == 0 &&
+            axis_limit_stably_active(MOTOR2)) {
             if (motor2_current_dir == CW) {
+                limit_triggered_2 = true;
+                motor2_position_steps = 0;
+                motor2_homed = true;
+                motor2_ready = true;
                 gpio_set_level(EN_PIN_2, 1); 
             }
             release_startup_lock_from_limit(MOTOR2);
@@ -767,7 +749,7 @@ void motor_position_impl(motor_id_t motor_id)
     *current_dir_ptr = CW; // 标记正在向下
 
     // 2. 启动前检查：如果已经在限位上，直接成功返回
-    if (gpio_get_level(STOP_PIN) == 0) {
+    if (axis_limit_stably_active(motor_id)) {
         // ESP_LOGI("POSITION_IMPL", "启动时检测到限位已闭合，直接设为原点。");
         *position_steps = 0;
         *limit_triggered = true;
@@ -784,7 +766,8 @@ void motor_position_impl(motor_id_t motor_id)
     // 3. 运动循环
     for (int i = 0; i < max_steps; i++) {
         // 实时检测限位
-        if (gpio_get_level(STOP_PIN) == 0) {
+        if (gpio_get_level(STOP_PIN) == 0 &&
+            axis_limit_stably_active(motor_id)) {
             // ESP_LOGI("POSITION_IMPL", "触碰限位，停止。");
             *limit_triggered = true;
             break;
@@ -796,10 +779,11 @@ void motor_position_impl(motor_id_t motor_id)
     }
 
     // 4. 结算
-    if (*limit_triggered) {
+    if (*limit_triggered && axis_limit_stably_active(motor_id)) {
         *position_steps = 0;
         *motor_homed = true;
     } else {
+        *limit_triggered = false;
         // ESP_LOGE("POSITION_IMPL", "找零失败：行程超出最大范围");
         *motor_homed = false;
     }
@@ -814,7 +798,7 @@ static bool motor_position_wait(motor_id_t motor_id)
         return false;
     }
 
-    if (axis_is_at_work_position(motor_id)) {
+    if (axis_limit_stably_active(motor_id)) {
         sync_axis_origin_from_limit(motor_id);
         return true;
     }
@@ -846,7 +830,7 @@ static bool motor_position_wait(motor_id_t motor_id)
     int waited = 0;
     while (waited <= SWITCH_TIMEOUT_MS) {
         bool homed = (motor_id == MOTOR1) ? motor1_homed : motor2_homed;
-        if (homed && axis_is_at_work_position(motor_id)) {
+        if (homed && axis_limit_stably_active(motor_id)) {
             update_axis_ready_flags();
             return true;
         }
@@ -897,20 +881,17 @@ static bool motor_homing_wait(motor_id_t motor_id)
 
     // 1. 定义临时指针和变量，用于操作对应电机的状态
     bool *homed_ptr;
-    int STOP_PIN;
 
     if (motor_id == MOTOR1) {
         homed_ptr = &motor1_homed;
-        STOP_PIN  = STOP_PIN_1;
     } else {
         homed_ptr = &motor2_homed;
-        STOP_PIN  = STOP_PIN_2;
     }
 
     // 软件标志
     if (!(*homed_ptr)) {
         // 但是物理引脚显示已压住限位
-        if (gpio_get_level(STOP_PIN) == 0) {
+        if (axis_limit_stably_active(motor_id)) {
             // ESP_LOGW("HOMING", "上电检测到位于限位处，自动建立坐标系。");
             sync_axis_origin_from_limit(motor_id);
             // 此时状态已修复，程序会继续往下执行发送指令
@@ -1001,8 +982,8 @@ static bool switch_to_axis(motor_id_t target)
     sync_axis_origin_from_limit(MOTOR1);
     sync_axis_origin_from_limit(MOTOR2);
 
-    bool target_at_work = axis_is_at_work_position(target);
-    bool other_at_work = axis_is_at_work_position(other);
+    bool target_at_work = axis_limit_stably_active(target);
+    bool other_at_work = axis_limit_stably_active(other);
     bool success = false;
 
     if (other_at_work) {
@@ -1021,8 +1002,8 @@ static bool switch_to_axis(motor_id_t target)
         goto done;
     }
 
-    success = axis_is_at_work_position(target) &&
-              !axis_is_at_work_position(other) && axis_is_safe(other);
+    success = axis_limit_stably_active(target) &&
+              !axis_limit_stably_active(other) && axis_is_safe(other);
 
     /* 上电只有目标头在限位、另一头尚未知时，不移动也应视为有效状态。 */
     if (target_at_work && !other_at_work) {
