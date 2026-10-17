@@ -40,14 +40,13 @@
 #define motor4_microstep 16
 
 #define SAFE_TARGET_MM         60.0f  // 动作目标：抬升到 60mm
-#define SAFE_SWITCH_HEIGHT_MM  60.0f  // 允许另一轴下降的最低安全高度
+#define TOOL_CHANGE_SETTLE_MS   500    // 上升脉冲完成后的安全等待
 #define SWITCH_TIMEOUT_MS      30000  // 下探找限位超时 30秒
 #define HOME_TIMEOUT_MS        30000  // 抬升到安全位置超时 30秒
 #define CHECK_INTERVAL_MS      20     // 检测间隔 20ms
 
 bool Motor_INI(void);
 void motor_startup_check(void);
-bool motor_axes_startup_locked(void);
 
 extern volatile bool motor1_ready;
 extern volatile bool motor2_ready;
@@ -90,8 +89,7 @@ typedef enum {
 typedef enum {
     MOTOR_CMD_MOVE_STEPS = 0,   // 按 steps 运动
     MOTOR_CMD_MOVE_TO_MM,       // 绝对位置就位 motor_move_to_mm()
-    MOTOR_CMD_POSITION,         // 找工作位 motor_positon()
-    MOTOR_CMD_HOMING            // 上升到安全位置 motor_homing()
+    MOTOR_CMD_POSITION          // 找工作位 motor_positon()
 } motor_cmd_type_t;
 
 typedef struct {
@@ -136,7 +134,6 @@ void motor_send_command(motor_id_t motor_id, motor_dir_t direction, int steps);
 void motor_send_command_mm(motor_id_t motor_id, motor_dir_t direction, float mm);
 float motor1_position_mm(void);
 float motor2_position_mm(void);
-void motor_homing_impl(motor_id_t motor_id);
 void motor_position_impl(motor_id_t motor_id);
 bool switch_to_CF(void);
 bool switch_to_RESIN(void);
