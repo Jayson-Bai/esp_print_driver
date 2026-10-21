@@ -454,7 +454,7 @@ static pid_ctrl_parameter_t g_pid_params_cf = {
 };
 
 static pid_ctrl_parameter_t g_pid_params_resin = {
-    .kp = 1.782f, .ki = 0.51f, .kd = 172.5f,
+    .kp = 1.782f, .ki = 0.6745f, .kd = 172.5f,
     .max_output = 100.0f, .min_output = 63.18f,
     .max_integral = 105.3f, .min_integral = 0.0f,
     .cal_type = PID_CAL_TYPE_POSITIONAL
