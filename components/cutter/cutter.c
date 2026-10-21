@@ -65,6 +65,13 @@ static void cutter_run_cut_sequence(void)
     gpio_set_level(CUT_PIN, 0);
     vTaskDelay(pdMS_TO_TICKS(500));
 
+    /* 第二次剪切：与第一次间隔 300ms，让刀头回弹到位再剪 */
+    vTaskDelay(pdMS_TO_TICKS(300));
+    gpio_set_level(CUT_PIN, 1);
+    vTaskDelay(pdMS_TO_TICKS(500));
+    gpio_set_level(CUT_PIN, 0);
+    vTaskDelay(pdMS_TO_TICKS(500));
+
     cutter_send_command(K2_PIN, false);
 }
 
