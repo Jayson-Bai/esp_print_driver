@@ -67,7 +67,8 @@
 #define EXTRUDER_PI                         3.14159265358979323846
 #define EXTRUDER_HARD_FAULT_MASK            (EXTRUDER_FAULT_RMT_SUBMIT | \
                                               EXTRUDER_FAULT_RESET_TIMEOUT | \
-                                              EXTRUDER_FAULT_RMT_DONE)
+                                              EXTRUDER_FAULT_RMT_DONE | \
+                                              EXTRUDER_FAULT_SYNC_TIMEOUT)
 
 static const char *TAG = "extruder";
 
@@ -1169,6 +1170,56 @@ void extruder_reset_absolute(int tool_id)
     runtime->reset_pending = true;
     runtime->state = EXTRUDER_STATE_RESETTING;
     portEXIT_CRITICAL(&g_extruder_mux);
+}
+
+bool extruder_sync_absolute_um(int tool_id, int64_t total_um, uint32_t seq,
+                               uint32_t timeout_ms)
+{
+    extruder_runtime_t *runtime = runtime_for_tool(tool_id);
+    if (runtime == NULL ||
+        total_um < -EXTRUDER_MAX_ABS_UM ||
+        total_um > EXTRUDER_MAX_ABS_UM) {
+        return false;
+    }
+
+    const int64_t expected_steps = absolute_um_to_steps(tool_id, total_um);
+    if (!extruder_set_absolute_um_at(tool_id, total_um, seq,
+                                     esp_timer_get_time())) {
+        return false;
+    }
+
+    TickType_t timeout_ticks = pdMS_TO_TICKS(timeout_ms);
+    if (timeout_ticks == 0) {
+        timeout_ticks = 1;
+    }
+    TickType_t start_tick = xTaskGetTickCount();
+    while ((xTaskGetTickCount() - start_tick) <= timeout_ticks) {
+        bool complete;
+        bool failed;
+        portENTER_CRITICAL(&g_extruder_mux);
+        failed = has_hard_fault(runtime->fault_flags);
+        complete = !runtime->reset_pending &&
+                   runtime->target_steps == expected_steps &&
+                   runtime->submitted_steps == expected_steps &&
+                   runtime->completed_steps == expected_steps &&
+                   runtime->queued_count == 0;
+        portEXIT_CRITICAL(&g_extruder_mux);
+        if (failed) {
+            return false;
+        }
+        if (complete &&
+            (runtime->channel == NULL ||
+             rmt_tx_wait_all_done(runtime->channel, 0) == ESP_OK)) {
+            return true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+
+    portENTER_CRITICAL(&g_extruder_mux);
+    runtime->fault_flags |= EXTRUDER_FAULT_SYNC_TIMEOUT;
+    runtime->state = EXTRUDER_STATE_FAULT;
+    portEXIT_CRITICAL(&g_extruder_mux);
+    return false;
 }
 
 bool extruder_reset_absolute_wait(int tool_id, uint32_t timeout_ms)

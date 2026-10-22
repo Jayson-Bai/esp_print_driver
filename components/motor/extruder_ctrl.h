@@ -25,6 +25,7 @@ typedef enum {
     EXTRUDER_FAULT_RMT_DONE         = 1U << 6, /* STEP 脉冲完成回调异常 */
     EXTRUDER_FAULT_LAG_LIMIT        = 1U << 7, /* 目标与已提交步数长期偏差过大 */
     EXTRUDER_FAULT_PROTOCOL         = 1U << 8, /* 参数超出固件协议范围 */
+    EXTRUDER_FAULT_SYNC_TIMEOUT     = 1U << 9, /* CUT 绝对位置完成屏障超时 */
 } extruder_fault_t;
 
 /* MCU 本地挤出运动状态；状态变化不需要上位机确认。 */
@@ -95,6 +96,14 @@ void extruder_reset_absolute(int tool_id);
  * 超时返回 false，并记录 RESET_TIMEOUT 硬故障，不能把超时当作复位成功。
  */
 bool extruder_reset_absolute_wait(int tool_id, uint32_t timeout_ms);
+
+/*
+ * 先权威下发最终绝对 E，再等待目标、已提交和已完成步数全部相等且 RMT
+ * 队列排空。返回 true 才表示最终送料/回抽动作真正执行完成；超时会锁存
+ * EXTRUDER_FAULT_SYNC_TIMEOUT 硬故障并返回 false。
+ */
+bool extruder_sync_absolute_um(int tool_id, int64_t total_um, uint32_t seq,
+                               uint32_t timeout_ms);
 
 /* UI 点动入口；dir_sign >= 0 为正向，dir_sign < 0 为反向。 */
 void extruder_ui_start(int tool_id, int dir_sign);

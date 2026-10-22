@@ -314,7 +314,7 @@ static void prepare_cut_event_done_context(uint32_t seq, const char *event_type)
     portEXIT_CRITICAL(&g_cut_event_done_mux);
 }
 
-static void cut_event_done_callback(void *ctx)
+static void cut_event_done_callback(void *ctx, bool ok)
 {
     cut_event_done_ctx_t done_ctx;
     cut_event_done_ctx_t *src = (cut_event_done_ctx_t *)ctx;
@@ -332,12 +332,22 @@ static void cut_event_done_callback(void *ctx)
         return;
     }
 
-    char done_msg[96];
-    int64_t done_us = esp_timer_get_time();
-    int done_len = snprintf(done_msg, sizeof(done_msg), "EVDONE %" PRIu32 " %s done %" PRId64 "\n",
-                            done_ctx.seq, done_ctx.event_type, done_us);
-    if (done_len > 0) {
-        send_uart_line(done_msg);
+    char result_msg[112];
+    int64_t result_us = esp_timer_get_time();
+    int result_len;
+    if (ok) {
+        result_len = snprintf(
+            result_msg, sizeof(result_msg),
+            "EVDONE %" PRIu32 " %s done %" PRId64 "\n",
+            done_ctx.seq, done_ctx.event_type, result_us);
+    } else {
+        result_len = snprintf(
+            result_msg, sizeof(result_msg),
+            "EVERR %" PRIu32 " %s actuator_failed %" PRId64 "\n",
+            done_ctx.seq, done_ctx.event_type, result_us);
+    }
+    if (result_len > 0) {
+        send_uart_line(result_msg);
     }
 }
 
@@ -420,6 +430,45 @@ static void handle_event(uint32_t seq, const char *event_type, const char *arg)
             return;
         }
         return;
+    }
+    if (strcmp(event_type, "extrude_sync") == 0) {
+        int tool_id = 0;
+        long long target_um = 0;
+        unsigned timeout_ms = 0;
+        unsigned cut_request_id = 0;
+        char trailing = '\0';
+        int parsed = sscanf(
+            arg, "%d %lld %u %u %c", &tool_id, &target_um,
+            &timeout_ms, &cut_request_id, &trailing);
+        if (parsed != 4 || (tool_id != 1 && tool_id != 2) ||
+            timeout_ms == 0 || cut_request_id == 0) {
+            char err_msg[112];
+            int64_t err_us = esp_timer_get_time();
+            int err_len = snprintf(
+                err_msg, sizeof(err_msg),
+                "EVERR %" PRIu32 " %s invalid_args %" PRId64 "\n",
+                seq, event_type, err_us);
+            if (err_len > 0) {
+                send_uart_line(err_msg);
+            }
+            return;
+        }
+        if (!extruder_sync_absolute_um(
+                tool_id, (int64_t)target_um, seq, timeout_ms)) {
+            char err_msg[144];
+            int64_t err_us = esp_timer_get_time();
+            int err_len = snprintf(
+                err_msg, sizeof(err_msg),
+                "EVERR %" PRIu32 " %s completion_failed %" PRId64
+                " target_um=%lld tool=%d\n",
+                seq, event_type, err_us, target_um, tool_id);
+            if (err_len > 0) {
+                send_uart_line(err_msg);
+            }
+            return;
+        }
+        reset_last_e_status();
+        goto done_sync;
     }
     if (strcmp(event_type, "extrude_reset") == 0) {
         int tool_id = (int)strtol(arg, NULL, 10);
@@ -505,6 +554,26 @@ static void handle_event(uint32_t seq, const char *event_type, const char *arg)
         return;
     }
 
+done_sync:
+    if (strcmp(event_type, "extrude_sync") == 0) {
+        int tool_id = 0;
+        long long target_um = 0;
+        unsigned timeout_ms = 0;
+        unsigned cut_request_id = 0;
+        (void)sscanf(arg, "%d %lld %u %u", &tool_id, &target_um,
+                     &timeout_ms, &cut_request_id);
+        char done_msg[160];
+        int64_t done_us = esp_timer_get_time();
+        int done_len = snprintf(
+            done_msg, sizeof(done_msg),
+            "EVDONE %" PRIu32 " %s done %" PRId64
+            " target_um=%lld tool=%d cut_request_id=%u\n",
+            seq, event_type, done_us, target_um, tool_id, cut_request_id);
+        if (done_len > 0) {
+            send_uart_line(done_msg);
+        }
+        return;
+    }
 done:
     {
         char done_msg[96];
