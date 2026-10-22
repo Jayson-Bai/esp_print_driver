@@ -5,6 +5,8 @@
 static const char *TAG = "Cutter";
 
 static QueueHandle_t cutter_queue = NULL;
+static bool cutter_send_command_internal(
+    int PIN_NUM, bool state, TaskHandle_t completion_task);
 
 //GPIO初始化
 void cutter_gpio_init(void) {
@@ -55,9 +57,15 @@ static bool cutter_try_begin_cut_sequence(cutter_cut_done_cb_t done_cb, void *do
     return started;
 }
 
-static void cutter_run_cut_sequence(void)
+static bool cutter_run_cut_sequence(void)
 {
-    cutter_send_command(K1_PIN, false);
+    // Preserve the original actuator timing: enqueue K1 and begin the
+    // seven-second descent window immediately.  Only the final rise waits
+    // for its pulse to finish, so EVDONE reports square-wave edge completion
+    // without delaying the physical actuator sequence.
+    if (!cutter_send_command_internal(K1_PIN, false, NULL)) {
+        return false;
+    }
     vTaskDelay(pdMS_TO_TICKS(7000));
 
     gpio_set_level(CUT_PIN, 1);
@@ -72,10 +80,10 @@ static void cutter_run_cut_sequence(void)
     gpio_set_level(CUT_PIN, 0);
     vTaskDelay(pdMS_TO_TICKS(500));
 
-    cutter_send_command(K2_PIN, false);
+    return cutter_send_command_wait(K2_PIN, false, 2000);
 }
 
-static void cutter_finish_cut_sequence(void)
+static void cutter_finish_cut_sequence(bool ok)
 {
     cutter_cut_done_cb_t done_cb = NULL;
     void *done_ctx = NULL;
@@ -89,15 +97,15 @@ static void cutter_finish_cut_sequence(void)
     portEXIT_CRITICAL(&cut_sequence_mux);
 
     if (done_cb != NULL) {
-        done_cb(done_ctx);
+        done_cb(done_ctx, ok);
     }
 }
 
 static void cutter_cut_sequence_task(void *pvParameters)
 {
     (void)pvParameters;
-    cutter_run_cut_sequence();
-    cutter_finish_cut_sequence();
+    bool ok = cutter_run_cut_sequence();
+    cutter_finish_cut_sequence(ok);
     vTaskDelete(NULL);
 }
 
@@ -130,9 +138,9 @@ bool cutter_run_cut_sequence_if_idle(void)
         return false;
     }
 
-    cutter_run_cut_sequence();
-    cutter_finish_cut_sequence();
-    return true;
+    bool ok = cutter_run_cut_sequence();
+    cutter_finish_cut_sequence(ok);
+    return ok;
 }
 
 
@@ -191,23 +199,43 @@ void cutter_task(void *pvParameters) {
             vTaskDelay(pdMS_TO_TICKS(100));
             gpio_set_level(pin, 1);
             ESP_LOGI(TAG, "GPIO%d 恢复为高电平", pin);
+            if (cmd.completion_task != NULL) {
+                xTaskNotifyGive(cmd.completion_task);
+            }
         }
     }
 }
 
 
-void cutter_send_command(int PIN_NUM, bool state) {
+static bool cutter_send_command_internal(int PIN_NUM, bool state,
+                                         TaskHandle_t completion_task) {
     if (cutter_queue == NULL) {
         ESP_LOGW(TAG, "命令队列未初始化，忽略发送");
-        return;
+        return false;
     }
 
     cutter_command_t cmd = {
         .pin = PIN_NUM,
-        .state = state  
+        .state = state,
+        .completion_task = completion_task,
     };
 
     if (xQueueSend(cutter_queue, &cmd, 0) != pdPASS) {
         ESP_LOGW(TAG, "队列已满，无法发送 GPIO%d 的命令", PIN_NUM);
+        return false;
     }
+    return true;
+}
+
+void cutter_send_command(int PIN_NUM, bool state) {
+    (void)cutter_send_command_internal(PIN_NUM, state, NULL);
+}
+
+bool cutter_send_command_wait(int PIN_NUM, bool state, uint32_t timeout_ms) {
+    TaskHandle_t caller = xTaskGetCurrentTaskHandle();
+    (void)ulTaskNotifyTake(pdTRUE, 0);
+    if (!cutter_send_command_internal(PIN_NUM, state, caller)) {
+        return false;
+    }
+    return ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(timeout_ms)) > 0;
 }
