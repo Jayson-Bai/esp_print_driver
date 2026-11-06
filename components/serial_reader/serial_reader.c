@@ -486,8 +486,26 @@ static void handle_event(uint32_t seq, const char *event_type, const char *arg)
         /*
          * 当前上位机对所有非切割事件都使用 event_seq == 0。因此只有非零事件号
          * 才能安全地作为重放去重标识；若对 0 也去重，之后同一工具的合法复位会被误吞。
+         *
+         * 注意：去重缓存 g_reset_event_done_seq 是 RAM 变量,跨打印会话(ESP 不重启)
+         * 一直保留。上位机每次会话都从 wire 1 重新计数,重复打印同一 NPZ 时
+         * extrude_reset 的 wire 序号恒定,第二次运行起会命中去重缓存。若命中时直接
+         * goto done 跳过物理复位,last_e_status 残留旧值且挤出器未真正复位。因此
+         * 命中去重时仍执行物理复位与状态清零,保证每次会话复位真实生效。
          */
         if (seq != 0 && reset_event_was_completed(tool_id, seq)) {
+            if (!extruder_reset_absolute_wait(tool_id, 150)) {
+                char err_msg[112];
+                int64_t err_us = esp_timer_get_time();
+                int err_len = snprintf(err_msg, sizeof(err_msg),
+                                       "EVERR %" PRIu32 " %s reset_timeout %" PRId64 "\n",
+                                       seq, event_type, err_us);
+                if (err_len > 0) {
+                    send_uart_line(err_msg);
+                }
+                return;
+            }
+            reset_last_e_status();
             goto done;
         }
         if (!extruder_reset_absolute_wait(tool_id, 150)) {
