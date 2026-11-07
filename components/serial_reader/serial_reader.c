@@ -9,7 +9,10 @@
 uint32_t g_uart_tx_fail_count;
 uint32_t g_uart_trunc_count;
 #include "esp_timer.h"
-#include "esp_app_desc.h"
+
+/* 编译期固件戳：__DATE__ __TIME__ 区分每次构建，
+ * 让 USTAT 自证板子烧的是哪一版，无运行时依赖。 */
+#define BUILD_STAMP __DATE__ "_" __TIME__
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -153,7 +156,13 @@ void uart0_init(int baud_rate)
         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
     };
 
-    uart_driver_install(UART_PORT, BUF_SIZE * 2, BUF_SIZE * 8, 30, &uart_event_queue, 0);
+    esp_err_t drv_err = uart_driver_install(UART_PORT, BUF_SIZE * 2, BUF_SIZE * 2,
+                                            30, &uart_event_queue, 0);
+    if (drv_err != ESP_OK) {
+        /* ring buffer 分配失败会让整个 UART 瘫掉（读不到 RX、写不出 TX），
+         * 必须在启动日志里喊出来而不是静默失败。 */
+        printf("UART0 DRIVER INSTALL FAILED err=%d\n", (int)drv_err);
+    }
     uart_param_config(UART_PORT, &uart_config);
     uart_set_pin(UART_PORT, UART_TX, UART_RX, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
     if (g_uart_tx_mutex == NULL) {
@@ -1007,12 +1016,12 @@ static void status_task(void *pvParameters)
         int64_t stat_ms = (prev_send_us > 0) ? (now_us - prev_send_us) / 1000 : 0;
         prev_send_us = now_us;
         int n2 = snprintf(buf + off, sizeof(buf) - (size_t)off,
-                          "USTAT fw=%s stat_ms=%" PRId64 " fifo_ovf=%" PRIu32
+                          "USTAT fw=" BUILD_STAMP " stat_ms=%" PRId64 " fifo_ovf=%" PRIu32
                           " buffer_full=%" PRIu32 " line_drop=%" PRIu32
                           " cmd_drop=%" PRIu32 " old_seq=%" PRIu32
                           " seq_gap=%" PRIu32 " parse_err=%" PRIu32
                           " tx_fail=%" PRIu32 " trunc=%" PRIu32 "\n",
-                          esp_app_get_description()->version, stat_ms,
+                          stat_ms,
                           uart_fifo_ovf_count, uart_buffer_full_count,
                           uart_line_drop_count, uart_cmd_drop_count,
                           uart_old_seq_count, uart_seq_gap_count,
@@ -1027,5 +1036,5 @@ static void status_task(void *pvParameters)
 
 void status_task_start(void)
 {
-    xTaskCreatePinnedToCore(status_task, "status_pub", 4096, NULL, 4, NULL, 1);
+    xTaskCreatePinnedToCore(status_task, "status_pub", 4096, NULL, 1, NULL, 1);
 }

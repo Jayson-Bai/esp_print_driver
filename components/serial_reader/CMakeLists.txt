@@ -12,7 +12,6 @@ idf_component_register(
                     cutter
                     driver
                     fan
-                    esp_app_format
 
     
     )
