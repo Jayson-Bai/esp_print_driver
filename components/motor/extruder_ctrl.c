@@ -98,6 +98,9 @@ typedef struct {
     /* 目标、已提交和已完成计数共同组成异步脉冲账本。 */
     int64_t target_steps;
     int64_t submitted_steps;
+    /* planner 每 tick 单次原子写：target-submitted 的一致快照，
+     * 供 status_task 免锁读出 e_res，避免分读两字段的配对错位。 */
+    int64_t e_res;
     int64_t completed_steps;
     /* UART 绝对位置及前馈锚点以微米计，各类控制时刻以微秒计。 */
     int64_t host_total_um;
@@ -837,6 +840,7 @@ static void planner_step(extruder_runtime_t *runtime, float elapsed_s,
 
     int64_t planning_error = snapshot.target_steps - snapshot.submitted_steps;
     update_lag_diagnostic(runtime, planning_error, now_us);
+    __atomic_store_n(&runtime->e_res, planning_error, __ATOMIC_RELAXED);
 
     bool host_fresh = snapshot.host_sample_valid &&
                       now_us <= snapshot.feedforward_valid_until_us;
@@ -1329,6 +1333,7 @@ bool extruder_get_status(int tool_id, extruder_status_t *status)
     portENTER_CRITICAL(&g_extruder_mux);
     status->target_steps = runtime->target_steps;
     status->submitted_steps = runtime->submitted_steps;
+    status->e_res = runtime->target_steps - runtime->submitted_steps;
     status->completed_steps = runtime->completed_steps;
     status->host_total_um = runtime->host_total_um;
     status->last_command_us = runtime->last_command_us;
@@ -1362,6 +1367,7 @@ bool extruder_get_status_uncontended(int tool_id, extruder_status_t *status)
      * 在 SMP spinlock 上互抢导致 200ms 节拍被拖到 ~600ms。 */
     status->target_steps              = __atomic_load_n(&runtime->target_steps, __ATOMIC_RELAXED);
     status->submitted_steps           = __atomic_load_n(&runtime->submitted_steps, __ATOMIC_RELAXED);
+    status->e_res                     = __atomic_load_n(&runtime->e_res, __ATOMIC_RELAXED);
     status->completed_steps           = __atomic_load_n(&runtime->completed_steps, __ATOMIC_RELAXED);
     status->host_total_um             = __atomic_load_n(&runtime->host_total_um, __ATOMIC_RELAXED);
     status->last_command_us           = __atomic_load_n(&runtime->last_command_us, __ATOMIC_RELAXED);

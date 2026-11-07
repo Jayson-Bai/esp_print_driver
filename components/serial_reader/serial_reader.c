@@ -944,7 +944,8 @@ static void status_task(void *pvParameters)
         if (have_estat) {
             int n = snprintf(buf + off, sizeof(buf) - (size_t)off,
                              "ESTAT tool=%d state=%s target_steps=%" PRId64
-                             " submitted_steps=%" PRId64 " completed_steps=%" PRId64
+                             " submitted_steps=%" PRId64 " e_res=%" PRId64
+                             " completed_steps=%" PRId64
                              " host_total_um=%" PRId64 " last_cmd_us=%" PRId64
                              " ff_until_us=%" PRId64 " ff_sps=%.3f v_sps=%.3f"
                              " phase=%.6f last_seq=%" PRIu32
@@ -954,6 +955,7 @@ static void status_task(void *pvParameters)
                              " dir=%d enabled=%d hold_latched=%d host_valid=%d\n",
                              status_tool, extruder_state_name(e_status.state),
                              e_status.target_steps, e_status.submitted_steps,
+                             e_status.e_res,
                              e_status.completed_steps, e_status.host_total_um,
                              e_status.last_command_us,
                              e_status.feedforward_valid_until_us,

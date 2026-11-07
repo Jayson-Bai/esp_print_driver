@@ -45,6 +45,7 @@ typedef enum {
 typedef struct {
     int64_t target_steps;                /* 最新绝对目标折算后的步数 */
     int64_t submitted_steps;             /* 已提交给 RMT 的累计步数 */
+    int64_t e_res;                       /* target-submitted 的规划残差，planner 单次原子写 */
     int64_t completed_steps;             /* RMT 已确认完成的累计步数 */
     int64_t host_total_um;                /* 上位机累计 E，单位为 10^-6 mm */
     int64_t last_command_us;              /* 最近 E 报文接收时刻，MCU 单调微秒时钟 */
