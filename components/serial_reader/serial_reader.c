@@ -880,7 +880,7 @@ static void status_task(void *pvParameters)
 {
     (void)pvParameters;
 
-    char buf[512];
+    char buf[1024];
     TickType_t last_wake = xTaskGetTickCount();
 
     while (1) {
@@ -965,7 +965,7 @@ static void status_task(void *pvParameters)
                              e_status.direction_sign, e_status.enabled ? 1 : 0,
                              e_status.host_hold_active ? 1 : 0,
                              e_status.host_sample_valid ? 1 : 0);
-            if (n > 0) off += n;
+            if (n > 0) { int adv = (n < (int)(sizeof(buf) - (size_t)off)) ? n : (int)(sizeof(buf) - (size_t)off - 1); off += adv; }
         }
 
         int n2 = snprintf(buf + off, sizeof(buf) - (size_t)off,
@@ -977,7 +977,7 @@ static void status_task(void *pvParameters)
                           uart_line_drop_count, uart_cmd_drop_count,
                           uart_old_seq_count, uart_seq_gap_count,
                           uart_parse_error_count);
-        if (n2 > 0) off += n2;
+        if (n2 > 0) { int adv = (n2 < (int)(sizeof(buf) - (size_t)off)) ? n2 : (int)(sizeof(buf) - (size_t)off - 1); off += adv; }
         send_status_buffer(buf, sizeof(buf), off);
 
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(200));
