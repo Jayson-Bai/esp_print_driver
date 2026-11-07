@@ -135,7 +135,7 @@ void uart0_init(int baud_rate)
         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
     };
 
-    uart_driver_install(UART_PORT, BUF_SIZE * 2, BUF_SIZE * 2, 30, &uart_event_queue, 0);
+    uart_driver_install(UART_PORT, BUF_SIZE * 2, BUF_SIZE * 8, 30, &uart_event_queue, 0);
     uart_param_config(UART_PORT, &uart_config);
     uart_set_pin(UART_PORT, UART_TX, UART_RX, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
     if (g_uart_tx_mutex == NULL) {
@@ -929,8 +929,6 @@ static void status_task(void *pvParameters)
                            fan_ok_cf, fan_ok_resin, tool, err,
                            last_seq_text, last_tool,
                            (double)last_total_um / 1000000.0, last_us);
-        send_status_buffer(buf, sizeof(buf), len);
-
         /* 物理限位优先，确保上电已有工作头或UI切头后状态不会沿用旧值。 */
         int status_tool = (tool == 1 || tool == 2) ? tool : g_current_tool_id;
         if (status_tool != 1 && status_tool != 2) {
@@ -938,45 +936,49 @@ static void status_task(void *pvParameters)
         }
         extruder_status_t e_status;
         memset(&e_status, 0, sizeof(e_status));
-        /* ESTAT 是 MCU 本地规划/脉冲账本快照，仅用于监测，不构成执行握手。 */
-        if (extruder_get_status(status_tool, &e_status)) {
-            len = snprintf(buf, sizeof(buf),
-                           "ESTAT tool=%d state=%s target_steps=%" PRId64
-                           " submitted_steps=%" PRId64 " completed_steps=%" PRId64
-                           " host_total_um=%" PRId64 " last_cmd_us=%" PRId64
-                           " ff_until_us=%" PRId64 " ff_sps=%.3f v_sps=%.3f"
-                           " phase=%.6f last_seq=%" PRIu32
-                           " fault=0x%08" PRIx32 " hard_fault=0x%08" PRIx32
-                           " rmt_submit_err=%" PRIu32
-                           " rmt_done_err=%" PRIu32 " qdepth=%" PRIu32
-                           " dir=%d enabled=%d hold_latched=%d host_valid=%d\n",
-                           status_tool, extruder_state_name(e_status.state),
-                           e_status.target_steps, e_status.submitted_steps,
-                           e_status.completed_steps, e_status.host_total_um,
-                           e_status.last_command_us,
-                           e_status.feedforward_valid_until_us,
-                           e_status.feedforward_steps_s,
-                           e_status.velocity_steps_s, e_status.phase, e_status.last_seq,
-                           e_status.fault_flags, e_status.hard_fault_flags,
-                           e_status.rmt_submit_errors,
-                           e_status.rmt_done_errors, e_status.queue_depth,
-                           e_status.direction_sign, e_status.enabled ? 1 : 0,
-                           e_status.host_hold_active ? 1 : 0,
-                           e_status.host_sample_valid ? 1 : 0);
-            send_status_buffer(buf, sizeof(buf), len);
+        bool have_estat = extruder_get_status(status_tool, &e_status);
+
+        /* 三帧合并一条发送：把 ESTAT/USTAT 追加到 buf，最后一并 uart0_write，
+         * 避免 TX ring buffer 在 NOSPLIT 模式下碎片化导致大帧被小帧饿死。 */
+        int off = len;
+        if (have_estat) {
+            int n = snprintf(buf + off, sizeof(buf) - (size_t)off,
+                             "ESTAT tool=%d state=%s target_steps=%" PRId64
+                             " submitted_steps=%" PRId64 " completed_steps=%" PRId64
+                             " host_total_um=%" PRId64 " last_cmd_us=%" PRId64
+                             " ff_until_us=%" PRId64 " ff_sps=%.3f v_sps=%.3f"
+                             " phase=%.6f last_seq=%" PRIu32
+                             " fault=0x%08" PRIx32 " hard_fault=0x%08" PRIx32
+                             " rmt_submit_err=%" PRIu32
+                             " rmt_done_err=%" PRIu32 " qdepth=%" PRIu32
+                             " dir=%d enabled=%d hold_latched=%d host_valid=%d\n",
+                             status_tool, extruder_state_name(e_status.state),
+                             e_status.target_steps, e_status.submitted_steps,
+                             e_status.completed_steps, e_status.host_total_um,
+                             e_status.last_command_us,
+                             e_status.feedforward_valid_until_us,
+                             e_status.feedforward_steps_s,
+                             e_status.velocity_steps_s, e_status.phase, e_status.last_seq,
+                             e_status.fault_flags, e_status.hard_fault_flags,
+                             e_status.rmt_submit_errors,
+                             e_status.rmt_done_errors, e_status.queue_depth,
+                             e_status.direction_sign, e_status.enabled ? 1 : 0,
+                             e_status.host_hold_active ? 1 : 0,
+                             e_status.host_sample_valid ? 1 : 0);
+            if (n > 0) off += n;
         }
 
-        /* USTAT 汇总 UART 与软件队列异常，便于无逻辑分析仪时定位链路丢包。 */
-        len = snprintf(buf, sizeof(buf),
-                       "USTAT fifo_ovf=%" PRIu32 " buffer_full=%" PRIu32
-                       " line_drop=%" PRIu32 " cmd_drop=%" PRIu32
-                       " old_seq=%" PRIu32 " seq_gap=%" PRIu32
-                       " parse_err=%" PRIu32 "\n",
-                       uart_fifo_ovf_count, uart_buffer_full_count,
-                       uart_line_drop_count, uart_cmd_drop_count,
-                       uart_old_seq_count, uart_seq_gap_count,
-                       uart_parse_error_count);
-        send_status_buffer(buf, sizeof(buf), len);
+        int n2 = snprintf(buf + off, sizeof(buf) - (size_t)off,
+                          "USTAT fifo_ovf=%" PRIu32 " buffer_full=%" PRIu32
+                          " line_drop=%" PRIu32 " cmd_drop=%" PRIu32
+                          " old_seq=%" PRIu32 " seq_gap=%" PRIu32
+                          " parse_err=%" PRIu32 "\n",
+                          uart_fifo_ovf_count, uart_buffer_full_count,
+                          uart_line_drop_count, uart_cmd_drop_count,
+                          uart_old_seq_count, uart_seq_gap_count,
+                          uart_parse_error_count);
+        if (n2 > 0) off += n2;
+        send_status_buffer(buf, sizeof(buf), off);
 
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(200));
     }
@@ -984,5 +986,5 @@ static void status_task(void *pvParameters)
 
 void status_task_start(void)
 {
-    xTaskCreatePinnedToCore(status_task, "status_pub", 4096, NULL, 1, NULL, 1);
+    xTaskCreatePinnedToCore(status_task, "status_pub", 4096, NULL, 4, NULL, 1);
 }
