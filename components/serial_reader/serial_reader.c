@@ -944,6 +944,13 @@ static void send_status_buffer(char *buf, size_t capacity, int formatted_len)
     uart0_write_status((const uint8_t *)buf, (int)send_len);
 }
 
+/* 回绕安全的"到期"判定：now >= deadline 返回 true。
+ * 用有符号差值比较，允许 TickType_t 回绕。 */
+static inline bool tick_reached(TickType_t now, TickType_t deadline)
+{
+    return (TickType_t)(now - deadline) < (TickType_t)(~(TickType_t)0 / 2U);
+}
+
 static void status_task(void *pvParameters)
 {
     (void)pvParameters;
@@ -998,7 +1005,7 @@ static void status_task(void *pvParameters)
                 sent_any = true;
             }
             next_estat += active ? ESTAT_ACTIVE_TICKS : ESTAT_IDLE_TICKS;
-            if ((next_estat - now) > portMAX_DELAY / 2) {
+            if (tick_reached(now, next_estat)) {
                 next_estat = now + (active ? ESTAT_ACTIVE_TICKS
                                            : ESTAT_IDLE_TICKS);
             }
@@ -1015,7 +1022,7 @@ static void status_task(void *pvParameters)
                 uart_seq_gap_count, uart_parse_error_count);
             send_status_buffer(buf, sizeof(buf), len);
             next_ustat += USTAT_TICKS;
-            if ((next_ustat - now) > portMAX_DELAY / 2) {
+            if (tick_reached(now, next_ustat)) {
                 next_ustat = now + USTAT_TICKS;
             }
             sent_any = true;
@@ -1061,7 +1068,7 @@ static void status_task(void *pvParameters)
                 (double)last_total_um / 1000000.0, last_us);
             send_status_buffer(buf, sizeof(buf), len);
             next_stat += STAT_TICKS;
-            if ((next_stat - now) > portMAX_DELAY / 2) {
+            if (tick_reached(now, next_stat)) {
                 next_stat = now + STAT_TICKS;
             }
             sent_any = true;
