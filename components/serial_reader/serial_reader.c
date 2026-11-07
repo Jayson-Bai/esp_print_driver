@@ -50,25 +50,19 @@ esp_err_t uart0_write(const uint8_t *data, int len)
     return (res == len) ? ESP_OK : ESP_FAIL;
 }
 
-/* 状态上报专用写：非阻塞 uart_tx_chars 直推环形缓冲，写不满记 tx_fail
- * 丢帧，绝不等待——保证 status_task 的 200ms 节拍不被 UART 拥塞拖死。 */
+/* 状态上报写：与正常链路完全相同的 uart_write_bytes + portMAX_DELAY。
+ * 8KB TX 环形缓冲 + 200ms 一帧 + 高波特率下几乎不会满，uart_write_bytes
+ * 实际立即返回；与正常路径共用同一写入语义，不引入第二条写路径。
+ * （此前 uart_tx_chars 直写硬件 FIFO、绕开 ring buffer，与 ISR 在 FIFO
+ * 上撞车曾致整个 UART TX 停摆——已弃用。free-size 门控对 NOSPLIT 缓冲
+ * 也并不可靠，同样弃用。） */
 static esp_err_t uart0_write_status(const uint8_t *data, int len)
 {
-    if (data == NULL || len <= 0) {
-        return ESP_OK;
-    }
-    if (g_uart_tx_mutex != NULL) {
-        xSemaphoreTake(g_uart_tx_mutex, portMAX_DELAY);
-    }
-    int res = uart_tx_chars(UART_PORT, (const char *)data, len);
-    if (g_uart_tx_mutex != NULL) {
-        xSemaphoreGive(g_uart_tx_mutex);
-    }
-    if (res < len) {
+    esp_err_t r = uart0_write(data, len);
+    if (r != ESP_OK) {
         __atomic_fetch_add(&g_uart_tx_fail_count, 1, __ATOMIC_RELAXED);
-        return ESP_FAIL;
     }
-    return ESP_OK;
+    return r;
 }
 
 static volatile int g_current_tool_id = 1; // 1=纤维, 2=树脂
