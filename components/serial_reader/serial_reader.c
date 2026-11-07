@@ -6,7 +6,10 @@
 #include "temperature.h"
 #include "extruder_ctrl.h"
 #include "driver/gpio.h"
+uint32_t g_uart_tx_fail_count;
+uint32_t g_uart_trunc_count;
 #include "esp_timer.h"
+#include "esp_app_desc.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -45,6 +48,27 @@ esp_err_t uart0_write(const uint8_t *data, int len)
         xSemaphoreGive(g_uart_tx_mutex);
     }
     return (res == len) ? ESP_OK : ESP_FAIL;
+}
+
+/* 状态上报专用写：非阻塞 uart_tx_chars 直推环形缓冲，写不满记 tx_fail
+ * 丢帧，绝不等待——保证 status_task 的 200ms 节拍不被 UART 拥塞拖死。 */
+static esp_err_t uart0_write_status(const uint8_t *data, int len)
+{
+    if (data == NULL || len <= 0) {
+        return ESP_OK;
+    }
+    if (g_uart_tx_mutex != NULL) {
+        xSemaphoreTake(g_uart_tx_mutex, portMAX_DELAY);
+    }
+    int res = uart_tx_chars(UART_PORT, (const char *)data, len);
+    if (g_uart_tx_mutex != NULL) {
+        xSemaphoreGive(g_uart_tx_mutex);
+    }
+    if (res < len) {
+        __atomic_fetch_add(&g_uart_tx_fail_count, 1, __ATOMIC_RELAXED);
+        return ESP_FAIL;
+    }
+    return ESP_OK;
 }
 
 static volatile int g_current_tool_id = 1; // 1=纤维, 2=树脂
@@ -282,6 +306,19 @@ static void get_last_e_status(bool *valid, uint32_t *seq, int *tool_id,
     *total_um = g_last_e_total_um;
     *mcu_us = g_last_e_us;
     portEXIT_CRITICAL(&g_e_status_mux);
+}
+
+/* 免锁版：状态上报用，避免 status_task 在 g_e_status_mux 上与其它 SMP
+ * 临界区相互等待拖慢 200ms 节拍。逐字段原子读，单字段保证原子。 */
+static void get_last_e_status_uncontended(bool *valid, uint32_t *seq,
+                                        int *tool_id, int64_t *total_um,
+                                        int64_t *mcu_us)
+{
+    *valid    = __atomic_load_n(&g_last_e_valid, __ATOMIC_RELAXED);
+    *seq      = __atomic_load_n(&g_last_e_seq, __ATOMIC_RELAXED);
+    *tool_id  = __atomic_load_n(&g_last_e_tool, __ATOMIC_RELAXED);
+    *total_um = __atomic_load_n(&g_last_e_total_um, __ATOMIC_RELAXED);
+    *mcu_us   = __atomic_load_n(&g_last_e_us, __ATOMIC_RELAXED);
 }
 
 typedef struct {
@@ -872,8 +909,9 @@ static void send_status_buffer(char *buf, size_t capacity, int formatted_len)
         buf[capacity - 2] = '\n';
         buf[capacity - 1] = '\0';
         send_len = capacity - 1;
+        __atomic_fetch_add(&g_uart_trunc_count, 1, __ATOMIC_RELAXED);
     }
-    uart0_write((const uint8_t *)buf, (int)send_len);
+    uart0_write_status((const uint8_t *)buf, (int)send_len);
 }
 
 static void status_task(void *pvParameters)
@@ -882,12 +920,13 @@ static void status_task(void *pvParameters)
 
     char buf[1024];
     TickType_t last_wake = xTaskGetTickCount();
+    int64_t prev_send_us = 0;
 
     while (1) {
-        float temp_cf = get_temperature1();
-        float temp_resin = get_temperature2();
-        float target_cf = pid_get_target(1);
-        float target_resin = pid_get_target(2);
+        float temp_cf = get_temperature1_uncontended();
+        float temp_resin = get_temperature2_uncontended();
+        float target_cf = pid_get_target_uncontended(1);
+        float target_resin = pid_get_target_uncontended(2);
         int fan_ok_cf = fan_get_state(FAN1) ? 1 : 0;
         int fan_ok_resin = fan_get_state(FAN2) ? 1 : 0;
         int tool = 0;
@@ -911,7 +950,7 @@ static void status_task(void *pvParameters)
         int last_tool;
         int64_t last_total_um;
         int64_t last_us;
-        get_last_e_status(&last_valid, &last_seq, &last_tool, &last_total_um, &last_us);
+        get_last_e_status_uncontended(&last_valid, &last_seq, &last_tool, &last_total_um, &last_us);
 
         char last_seq_text[16];
         if (last_valid) {
@@ -970,15 +1009,21 @@ static void status_task(void *pvParameters)
             if (n > 0) { int adv = (n < (int)(sizeof(buf) - (size_t)off)) ? n : (int)(sizeof(buf) - (size_t)off - 1); off += adv; }
         }
 
+        int64_t now_us = esp_timer_get_time();
+        int64_t stat_ms = (prev_send_us > 0) ? (now_us - prev_send_us) / 1000 : 0;
+        prev_send_us = now_us;
         int n2 = snprintf(buf + off, sizeof(buf) - (size_t)off,
-                          "USTAT fifo_ovf=%" PRIu32 " buffer_full=%" PRIu32
-                          " line_drop=%" PRIu32 " cmd_drop=%" PRIu32
-                          " old_seq=%" PRIu32 " seq_gap=%" PRIu32
-                          " parse_err=%" PRIu32 "\n",
+                          "USTAT fw=%s stat_ms=%" PRId64 " fifo_ovf=%" PRIu32
+                          " buffer_full=%" PRIu32 " line_drop=%" PRIu32
+                          " cmd_drop=%" PRIu32 " old_seq=%" PRIu32
+                          " seq_gap=%" PRIu32 " parse_err=%" PRIu32
+                          " tx_fail=%" PRIu32 " trunc=%" PRIu32 "\n",
+                          esp_app_get_description()->version, stat_ms,
                           uart_fifo_ovf_count, uart_buffer_full_count,
                           uart_line_drop_count, uart_cmd_drop_count,
                           uart_old_seq_count, uart_seq_gap_count,
-                          uart_parse_error_count);
+                          uart_parse_error_count,
+                          g_uart_tx_fail_count, g_uart_trunc_count);
         if (n2 > 0) { int adv = (n2 < (int)(sizeof(buf) - (size_t)off)) ? n2 : (int)(sizeof(buf) - (size_t)off - 1); off += adv; }
         send_status_buffer(buf, sizeof(buf), off);
 

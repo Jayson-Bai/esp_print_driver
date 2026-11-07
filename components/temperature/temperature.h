@@ -35,6 +35,8 @@ void init_adc1();
 void init_adc2();
 float get_temperature1();
 float get_temperature2();
+float get_temperature1_uncontended();
+float get_temperature2_uncontended();
 void deinit_adc1();
 void deinit_adc2();
 void temperature_task_start(void);

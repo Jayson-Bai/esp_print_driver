@@ -688,6 +688,19 @@ float pid_get_target(int channel)
     return ret;
 }
 
+/* 免锁读取：PID 目标为单次对齐 float 写，状态上报用此路避开
+ * g_pid_spinlock 与其它 SMP 临界区的相互等待。 */
+float pid_get_target_uncontended(int channel)
+{
+    float ret = 0.0f;
+    if (channel == 1) {
+        __atomic_load(&g_pid_target_cf, &ret, __ATOMIC_RELAXED);
+    } else if (channel == 2) {
+        __atomic_load(&g_pid_target_resin, &ret, __ATOMIC_RELAXED);
+    }
+    return ret;
+}
+
 bool pid_get_enable(int channel)
 {
     bool ret;

@@ -143,6 +143,7 @@ void PID1_Task(void *pvParameters);
 void PID_send_command(int channel, float target_temp, bool enable);
 void PID2_Task(void *pvParameters);
 float pid_get_target(int channel);
+float pid_get_target_uncontended(int channel);
 bool pid_get_enable(int channel);
 void pid_set_params(int channel, float kp, float ki, float kd,
                     float max_output, float min_output,

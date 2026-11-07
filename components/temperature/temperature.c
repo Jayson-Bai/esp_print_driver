@@ -44,6 +44,15 @@ float get_temperature1()
     return temp;
 }
 
+/* 免锁读取：温度标量单次对齐写本身原子，状态上报走这条路避免
+ * status_task 与高频写任务的 SMP 临界区相互拖慢节拍。 */
+float get_temperature1_uncontended()
+{
+    float temp = 0.0f;
+    __atomic_load(&g_temp1, &temp, __ATOMIC_RELAXED);
+    return temp;
+}
+
 // 释放ADC资源
 void deinit_adc1() {
     if (cali_handle_1 != NULL) {
@@ -76,6 +85,13 @@ float get_temperature2()
     portENTER_CRITICAL(&g_temp_mux);
     temp = g_temp2;
     portEXIT_CRITICAL(&g_temp_mux);
+    return temp;
+}
+
+float get_temperature2_uncontended()
+{
+    float temp = 0.0f;
+    __atomic_load(&g_temp2, &temp, __ATOMIC_RELAXED);
     return temp;
 }
 
