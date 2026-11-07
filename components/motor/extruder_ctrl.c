@@ -692,6 +692,7 @@ static void complete_reset_if_drained(extruder_runtime_t *runtime, int64_t now_u
         runtime->submitted_steps == runtime->completed_steps) {
         runtime->target_steps = 0;
         runtime->submitted_steps = 0;
+        runtime->e_res = 0;
         runtime->completed_steps = 0;
         runtime->host_total_um = 0;
         runtime->last_command_us = 0;
