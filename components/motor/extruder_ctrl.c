@@ -1352,6 +1352,45 @@ bool extruder_get_status(int tool_id, extruder_status_t *status)
     return true;
 }
 
+bool extruder_get_status_uncontended(int tool_id, extruder_status_t *status)
+{
+    extruder_runtime_t *runtime = runtime_for_tool(tool_id);
+    if (runtime == NULL || status == NULL) {
+        return false;
+    }
+    /* 逐字段原子读，不进 g_extruder_mux：避免 status_task 与 planner_step
+     * 在 SMP spinlock 上互抢导致 200ms 节拍被拖到 ~600ms。 */
+    status->target_steps              = __atomic_load_n(&runtime->target_steps, __ATOMIC_RELAXED);
+    status->submitted_steps           = __atomic_load_n(&runtime->submitted_steps, __ATOMIC_RELAXED);
+    status->completed_steps           = __atomic_load_n(&runtime->completed_steps, __ATOMIC_RELAXED);
+    status->host_total_um             = __atomic_load_n(&runtime->host_total_um, __ATOMIC_RELAXED);
+    status->last_command_us           = __atomic_load_n(&runtime->last_command_us, __ATOMIC_RELAXED);
+    status->feedforward_valid_until_us= __atomic_load_n(&runtime->feedforward_valid_until_us, __ATOMIC_RELAXED);
+    float ff                          = 0.0f;
+    float speed                       = 0.0f;
+    float ph                          = 0.0f;
+    __atomic_load(&runtime->feedforward_steps_s, &ff, __ATOMIC_RELAXED);
+    int dir                           = __atomic_load_n(&runtime->direction_sign, __ATOMIC_RELAXED);
+    __atomic_load(&runtime->speed_sps, &speed, __ATOMIC_RELAXED);
+    __atomic_load(&runtime->phase, &ph, __ATOMIC_RELAXED);
+    status->feedforward_steps_s       = ff;
+    status->velocity_steps_s          = speed * (float)dir;
+    status->phase                     = ph;
+    status->last_seq                  = __atomic_load_n(&runtime->last_seq, __ATOMIC_RELAXED);
+    uint32_t faults                   = __atomic_load_n(&runtime->fault_flags, __ATOMIC_RELAXED);
+    status->fault_flags               = faults;
+    status->hard_fault_flags          = faults & EXTRUDER_HARD_FAULT_MASK;
+    status->rmt_submit_errors         = __atomic_load_n(&runtime->rmt_submit_errors, __ATOMIC_RELAXED);
+    status->rmt_done_errors           = __atomic_load_n(&runtime->rmt_done_errors, __ATOMIC_RELAXED);
+    status->queue_depth               = __atomic_load_n(&runtime->queued_count, __ATOMIC_RELAXED);
+    status->direction_sign            = dir;
+    status->enabled                   = __atomic_load_n(&runtime->enabled, __ATOMIC_RELAXED);
+    status->host_hold_active          = __atomic_load_n(&runtime->host_hold_active, __ATOMIC_RELAXED);
+    status->host_sample_valid         = __atomic_load_n(&runtime->host_sample_valid, __ATOMIC_RELAXED);
+    status->state                     = __atomic_load_n(&runtime->state, __ATOMIC_RELAXED);
+    return true;
+}
+
 bool extruder_is_ready(int tool_id)
 {
     extruder_runtime_t *runtime = runtime_for_tool(tool_id);

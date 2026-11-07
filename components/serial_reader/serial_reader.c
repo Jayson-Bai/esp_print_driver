@@ -936,7 +936,7 @@ static void status_task(void *pvParameters)
         }
         extruder_status_t e_status;
         memset(&e_status, 0, sizeof(e_status));
-        bool have_estat = extruder_get_status(status_tool, &e_status);
+        bool have_estat = extruder_get_status_uncontended(status_tool, &e_status);
 
         /* 三帧合并一条发送：把 ESTAT/USTAT 追加到 buf，最后一并 uart0_write，
          * 避免 TX ring buffer 在 NOSPLIT 模式下碎片化导致大帧被小帧饿死。 */

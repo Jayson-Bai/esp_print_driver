@@ -119,5 +119,13 @@ void extruder_notify_transport_fault(uint32_t fault_flags);
 /* 原子读取指定挤出器的状态快照；参数非法时返回 false。 */
 bool extruder_get_status(int tool_id, extruder_status_t *status);
 
+/*
+ * 与 extruder_get_status 相同，但不进入 g_extruder_mux 临界区。
+ * 仅用于 status_task 等高频率只读场景；字段用 __atomic_load_n 逐条读取，
+ * 不保证多字段间是同一时刻的快照，但保证每个字段都是原子值。
+ * 调用方需要强一致快照时仍应使用 extruder_get_status。
+ */
+bool extruder_get_status_uncontended(int tool_id, extruder_status_t *status);
+
 /* 仅表示本地任务、RMT 通道和编码器已初始化，不代表物理送料没有失步。 */
 bool extruder_is_ready(int tool_id);
