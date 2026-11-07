@@ -948,117 +948,140 @@ static void status_task(void *pvParameters)
 {
     (void)pvParameters;
 
-    char buf[1024];
+    char buf[512];
     TickType_t last_wake = xTaskGetTickCount();
-    int64_t prev_send_us = 0;
+
+    /* 三帧独立节拍（tick 数），互不挤占：
+     *   ESTAT  活跃期 50ms，IDLE/HOLD 降到 1Hz（心跳保底）
+     *   USTAT  全程 1Hz 心跳
+     *   STAT   保持 200ms（UI 温度/工具显示用）
+     * 用各自的 next_* 截止时间判定，主循环以最近的节拍睡眠，
+     * 醒一次只发到期的那一类帧，带宽可控。 */
+    const TickType_t ESTAT_ACTIVE_TICKS = pdMS_TO_TICKS(50);
+    const TickType_t ESTAT_IDLE_TICKS   = pdMS_TO_TICKS(1000);
+    const TickType_t USTAT_TICKS        = pdMS_TO_TICKS(1000);
+    const TickType_t STAT_TICKS         = pdMS_TO_TICKS(200);
+
+    TickType_t next_estat = last_wake;
+    TickType_t next_ustat = last_wake;
+    TickType_t next_stat  = last_wake;
 
     while (1) {
-        float temp_cf = get_temperature1_uncontended();
-        float temp_resin = get_temperature2_uncontended();
-        float target_cf = pid_get_target_uncontended(1);
-        float target_resin = pid_get_target_uncontended(2);
-        int fan_ok_cf = fan_get_state(FAN1) ? 1 : 0;
-        int fan_ok_resin = fan_get_state(FAN2) ? 1 : 0;
-        int tool = 0;
-        int err = 0;
-        int sw1 = gpio_get_level(STOP_PIN_1);
-        int sw2 = gpio_get_level(STOP_PIN_2);
+        TickType_t now = xTaskGetTickCount();
+        bool sent_any = false;
 
-        if (sw1 == 0 && sw2 == 0) {
-            tool = 0;
-            err = 1;
-        } else if (sw1 == 0) {
-            tool = 1;
-        } else if (sw2 == 0) {
-            tool = 2;
-        } else {
-            tool = 0;
+        /* ---- ESTAT：挤出运动状态，只发分析所需字段 ---- */
+        if ((now - next_estat) < portMAX_DELAY / 2) {
+            int status_tool = (get_current_tool_id() == 2) ? 2 : 1;
+            extruder_status_t e;
+            memset(&e, 0, sizeof(e));
+            bool active = false;
+            if (extruder_get_status_uncontended(status_tool, &e)) {
+                active = (e.state == EXTRUDER_STATE_ACCEL ||
+                          e.state == EXTRUDER_STATE_RUN ||
+                          e.state == EXTRUDER_STATE_DECEL ||
+                          e.state == EXTRUDER_STATE_DIR_CHANGE);
+                int len = snprintf(buf, sizeof(buf),
+                    "ESTAT tool=%d state=%s target_steps=%" PRId64
+                    " submitted_steps=%" PRId64 " e_res=%" PRId64
+                    " last_seq=%" PRIu32 " ff_sps=%.3f v_sps=%.3f"
+                    " phase=%.6f last_cmd_us=%" PRId64
+                    " fault=0x%08" PRIx32 " hard_fault=0x%08" PRIx32 "\n",
+                    status_tool, extruder_state_name(e.state),
+                    e.target_steps, e.submitted_steps, e.e_res,
+                    e.last_seq,
+                    (double)e.feedforward_steps_s,
+                    (double)e.velocity_steps_s,
+                    (double)e.phase, e.last_command_us,
+                    e.fault_flags, e.hard_fault_flags);
+                send_status_buffer(buf, sizeof(buf), len);
+                sent_any = true;
+            }
+            next_estat += active ? ESTAT_ACTIVE_TICKS : ESTAT_IDLE_TICKS;
+            if ((next_estat - now) > portMAX_DELAY / 2) {
+                next_estat = now + (active ? ESTAT_ACTIVE_TICKS
+                                           : ESTAT_IDLE_TICKS);
+            }
         }
 
-        bool last_valid;
-        uint32_t last_seq;
-        int last_tool;
-        int64_t last_total_um;
-        int64_t last_us;
-        get_last_e_status_uncontended(&last_valid, &last_seq, &last_tool, &last_total_um, &last_us);
-
-        char last_seq_text[16];
-        if (last_valid) {
-            snprintf(last_seq_text, sizeof(last_seq_text), "%" PRIu32, last_seq);
-        } else {
-            memcpy(last_seq_text, "-1", 3);
+        /* ---- USTAT：链路健康计数器，全程 1Hz ---- */
+        if ((now - next_ustat) < portMAX_DELAY / 2) {
+            int len = snprintf(buf, sizeof(buf),
+                "USTAT fifo_ovf=%" PRIu32 " buffer_full=%" PRIu32
+                " line_drop=%" PRIu32 " cmd_drop=%" PRIu32
+                " seq_gap=%" PRIu32 " parse_err=%" PRIu32 "\n",
+                uart_fifo_ovf_count, uart_buffer_full_count,
+                uart_line_drop_count, uart_cmd_drop_count,
+                uart_seq_gap_count, uart_parse_error_count);
+            send_status_buffer(buf, sizeof(buf), len);
+            next_ustat += USTAT_TICKS;
+            if ((next_ustat - now) > portMAX_DELAY / 2) {
+                next_ustat = now + USTAT_TICKS;
+            }
+            sent_any = true;
         }
 
-        /* STAT 保持原有 UI 状态格式；last_e_abs 仍以 mm 输出。 */
-        int len = snprintf(buf, sizeof(buf),
-                           "STAT temp_cf=%.1f temp_resin=%.1f target_cf=%.1f target_resin=%.1f "
-                           "fan_ok_cf=%d fan_ok_resin=%d tool=%d err=%d "
-                           "last_e_seq=%s last_e_tool=%d last_e_abs=%.6f last_e_us=%" PRId64 "\n",
-                           temp_cf, temp_resin, target_cf, target_resin,
-                           fan_ok_cf, fan_ok_resin, tool, err,
-                           last_seq_text, last_tool,
-                           (double)last_total_um / 1000000.0, last_us);
-        /* 物理限位优先，确保上电已有工作头或UI切头后状态不会沿用旧值。 */
-        int status_tool = (tool == 1 || tool == 2) ? tool : g_current_tool_id;
-        if (status_tool != 1 && status_tool != 2) {
-            status_tool = 1;
-        }
-        extruder_status_t e_status;
-        memset(&e_status, 0, sizeof(e_status));
-        bool have_estat = extruder_get_status_uncontended(status_tool, &e_status);
+        /* ---- STAT：温度/工具/最近 E，200ms ---- */
+        if ((now - next_stat) < portMAX_DELAY / 2) {
+            float temp_cf = get_temperature1_uncontended();
+            float temp_resin = get_temperature2_uncontended();
+            float target_cf = pid_get_target_uncontended(1);
+            float target_resin = pid_get_target_uncontended(2);
+            int fan_ok_cf = fan_get_state(FAN1) ? 1 : 0;
+            int fan_ok_resin = fan_get_state(FAN2) ? 1 : 0;
+            int tool = 0, err = 0;
+            int sw1 = gpio_get_level(STOP_PIN_1);
+            int sw2 = gpio_get_level(STOP_PIN_2);
+            if (sw1 == 0 && sw2 == 0) { tool = 0; err = 1; }
+            else if (sw1 == 0) { tool = 1; }
+            else if (sw2 == 0) { tool = 2; }
+            else { tool = 0; }
 
-        /* 三帧合并一条发送：把 ESTAT/USTAT 追加到 buf，最后一并 uart0_write，
-         * 避免 TX ring buffer 在 NOSPLIT 模式下碎片化导致大帧被小帧饿死。 */
-        int off = len;
-        if (have_estat) {
-            int n = snprintf(buf + off, sizeof(buf) - (size_t)off,
-                             "ESTAT tool=%d state=%s target_steps=%" PRId64
-                             " submitted_steps=%" PRId64 " e_res=%" PRId64
-                             " completed_steps=%" PRId64
-                             " host_total_um=%" PRId64 " last_cmd_us=%" PRId64
-                             " ff_until_us=%" PRId64 " ff_sps=%.3f v_sps=%.3f"
-                             " phase=%.6f last_seq=%" PRIu32
-                             " fault=0x%08" PRIx32 " hard_fault=0x%08" PRIx32
-                             " rmt_submit_err=%" PRIu32
-                             " rmt_done_err=%" PRIu32 " qdepth=%" PRIu32
-                             " dir=%d enabled=%d hold_latched=%d host_valid=%d\n",
-                             status_tool, extruder_state_name(e_status.state),
-                             e_status.target_steps, e_status.submitted_steps,
-                             e_status.e_res,
-                             e_status.completed_steps, e_status.host_total_um,
-                             e_status.last_command_us,
-                             e_status.feedforward_valid_until_us,
-                             e_status.feedforward_steps_s,
-                             e_status.velocity_steps_s, e_status.phase, e_status.last_seq,
-                             e_status.fault_flags, e_status.hard_fault_flags,
-                             e_status.rmt_submit_errors,
-                             e_status.rmt_done_errors, e_status.queue_depth,
-                             e_status.direction_sign, e_status.enabled ? 1 : 0,
-                             e_status.host_hold_active ? 1 : 0,
-                             e_status.host_sample_valid ? 1 : 0);
-            if (n > 0) { int adv = (n < (int)(sizeof(buf) - (size_t)off)) ? n : (int)(sizeof(buf) - (size_t)off - 1); off += adv; }
+            bool last_valid;
+            uint32_t last_seq; int last_tool;
+            int64_t last_total_um; int64_t last_us;
+            get_last_e_status_uncontended(&last_valid, &last_seq,
+                                          &last_tool, &last_total_um,
+                                          &last_us);
+            char last_seq_text[16];
+            if (last_valid) {
+                snprintf(last_seq_text, sizeof(last_seq_text),
+                         "%" PRIu32, last_seq);
+            } else {
+                memcpy(last_seq_text, "-1", 3);
+            }
+            int len = snprintf(buf, sizeof(buf),
+                "STAT temp_cf=%.1f temp_resin=%.1f target_cf=%.1f"
+                " target_resin=%.1f fan_ok_cf=%d fan_ok_resin=%d"
+                " tool=%d err=%d last_e_seq=%s last_e_tool=%d"
+                " last_e_abs=%.6f last_e_us=%" PRId64 "\n",
+                temp_cf, temp_resin, target_cf, target_resin,
+                fan_ok_cf, fan_ok_resin, tool, err,
+                last_seq_text, last_tool,
+                (double)last_total_um / 1000000.0, last_us);
+            send_status_buffer(buf, sizeof(buf), len);
+            next_stat += STAT_TICKS;
+            if ((next_stat - now) > portMAX_DELAY / 2) {
+                next_stat = now + STAT_TICKS;
+            }
+            sent_any = true;
         }
 
-        int64_t now_us = esp_timer_get_time();
-        int64_t stat_ms = (prev_send_us > 0) ? (now_us - prev_send_us) / 1000 : 0;
-        prev_send_us = now_us;
-        int n2 = snprintf(buf + off, sizeof(buf) - (size_t)off,
-                          "USTAT fw=" BUILD_STAMP " stat_ms=%" PRId64 " fifo_ovf=%" PRIu32
-                          " buffer_full=%" PRIu32 " line_drop=%" PRIu32
-                          " cmd_drop=%" PRIu32 " old_seq=%" PRIu32
-                          " seq_gap=%" PRIu32 " parse_err=%" PRIu32
-                          " tx_fail=%" PRIu32 " trunc=%" PRIu32 " tx_blk_us=%" PRIu32 " tx_free_min=%" PRIu32 "\n",
-                          stat_ms,
-                          uart_fifo_ovf_count, uart_buffer_full_count,
-                          uart_line_drop_count, uart_cmd_drop_count,
-                          uart_old_seq_count, uart_seq_gap_count,
-                          uart_parse_error_count,
-                          g_uart_tx_fail_count, g_uart_trunc_count,
-                          g_uart_tx_max_block_us, g_uart_tx_min_free_after);
-        if (n2 > 0) { int adv = (n2 < (int)(sizeof(buf) - (size_t)off)) ? n2 : (int)(sizeof(buf) - (size_t)off - 1); off += adv; }
-        send_status_buffer(buf, sizeof(buf), off);
-
-        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(200));
+        /* 睡到最近一个到期节拍；刚发过帧也至少让出 1 tick 防忙等。 */
+        TickType_t wake = xTaskGetTickCount();
+        TickType_t d1 = next_estat - wake;
+        TickType_t d2 = next_ustat - wake;
+        TickType_t d3 = next_stat - wake;
+        TickType_t dmin = d1 < d2 ? (d1 < d3 ? d1 : d3)
+                                  : (d2 < d3 ? d2 : d3);
+        if (dmin > portMAX_DELAY / 2) {
+            dmin = 1;                 /* 已过期：下一拍立刻补 */
+        }
+        if (dmin == 0) {
+            dmin = 1;
+        }
+        (void)sent_any;
+        vTaskDelayUntil(&last_wake, dmin);
     }
 }
 
