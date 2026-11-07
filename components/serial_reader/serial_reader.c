@@ -1067,21 +1067,13 @@ static void status_task(void *pvParameters)
             sent_any = true;
         }
 
-        /* 睡到最近一个到期节拍；刚发过帧也至少让出 1 tick 防忙等。 */
-        TickType_t wake = xTaskGetTickCount();
-        TickType_t d1 = next_estat - wake;
-        TickType_t d2 = next_ustat - wake;
-        TickType_t d3 = next_stat - wake;
-        TickType_t dmin = d1 < d2 ? (d1 < d3 ? d1 : d3)
-                                  : (d2 < d3 ? d2 : d3);
-        if (dmin > portMAX_DELAY / 2) {
-            dmin = 1;                 /* 已过期：下一拍立刻补 */
-        }
-        if (dmin == 0) {
-            dmin = 1;
-        }
+        /* 以固定的相对小步长睡眠，不按 last_wake 锁相位：
+         * 每轮先补发所有到期帧，再相对延迟 STEP_MS；到期判定
+         * (now - next_x) 用回绕安全比较，长时不发也不会卡死。
+         * STEP_MS 取 min(各节拍) 的 1/2，保证最密的 ESTAT 50ms 仍能
+         * 约每 10ms 检查一次，误差 < 一个 STEP。 */
         (void)sent_any;
-        vTaskDelayUntil(&last_wake, dmin);
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
