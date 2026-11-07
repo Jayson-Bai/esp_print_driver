@@ -8,6 +8,11 @@
 #include "driver/gpio.h"
 uint32_t g_uart_tx_fail_count;
 uint32_t g_uart_trunc_count;
+/* 状态帧写入诊断：uart_write_bytes 的真实耗时（最长一次）和
+ * 写入后 ring buffer 剩余空间（最小一次）。用于分辨"帧被塞进
+ * NOSPLIT buffer 但 ISR 还没发出"vs"调用根本没返回"。 */
+uint32_t g_uart_tx_max_block_us;
+uint32_t g_uart_tx_min_free_after;
 #include "esp_timer.h"
 
 /* 编译期固件戳：__DATE__ __TIME__ 区分每次构建，
@@ -61,9 +66,31 @@ esp_err_t uart0_write(const uint8_t *data, int len)
  * 也并不可靠，同样弃用。） */
 static esp_err_t uart0_write_status(const uint8_t *data, int len)
 {
+    int64_t t0 = esp_timer_get_time();
     esp_err_t r = uart0_write(data, len);
+    int64_t t1 = esp_timer_get_time();
     if (r != ESP_OK) {
         __atomic_fetch_add(&g_uart_tx_fail_count, 1, __ATOMIC_RELAXED);
+    }
+    /* 记录状态帧写入最长阻塞时间。200ms 一帧，写耗时若 >10ms 一定有问题。
+     * tx_buffer_size>0 走 ring buffer 时应立即返回（亚毫秒）；
+     * 若出现 ms 级耗时，说明 xRingbufferSend 在等空间。 */
+    uint32_t block_us = (uint32_t)(t1 - t0);
+    uint32_t prev_max = __atomic_load_n(&g_uart_tx_max_block_us, __ATOMIC_RELAXED);
+    while (block_us > prev_max) {
+        if (__atomic_compare_exchange_n(&g_uart_tx_max_block_us, &prev_max, block_us,
+                                        true, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+            break;
+        }
+    }
+    /* 写完后查 ring buffer 剩余：越小说明越是贴着边界在写。 */
+    size_t free_after = 0;
+    if (uart_get_tx_buffer_free_size(UART_PORT, &free_after) == ESP_OK) {
+        uint32_t cur = (uint32_t)free_after;
+        uint32_t prev_min = __atomic_load_n(&g_uart_tx_min_free_after, __ATOMIC_RELAXED);
+        if (prev_min == 0 || cur < prev_min) {
+            __atomic_store_n(&g_uart_tx_min_free_after, cur, __ATOMIC_RELAXED);
+        }
     }
     return r;
 }
@@ -1020,13 +1047,14 @@ static void status_task(void *pvParameters)
                           " buffer_full=%" PRIu32 " line_drop=%" PRIu32
                           " cmd_drop=%" PRIu32 " old_seq=%" PRIu32
                           " seq_gap=%" PRIu32 " parse_err=%" PRIu32
-                          " tx_fail=%" PRIu32 " trunc=%" PRIu32 "\n",
+                          " tx_fail=%" PRIu32 " trunc=%" PRIu32 " tx_blk_us=%" PRIu32 " tx_free_min=%" PRIu32 "\n",
                           stat_ms,
                           uart_fifo_ovf_count, uart_buffer_full_count,
                           uart_line_drop_count, uart_cmd_drop_count,
                           uart_old_seq_count, uart_seq_gap_count,
                           uart_parse_error_count,
-                          g_uart_tx_fail_count, g_uart_trunc_count);
+                          g_uart_tx_fail_count, g_uart_trunc_count,
+                          g_uart_tx_max_block_us, g_uart_tx_min_free_after);
         if (n2 > 0) { int adv = (n2 < (int)(sizeof(buf) - (size_t)off)) ? n2 : (int)(sizeof(buf) - (size_t)off - 1); off += adv; }
         send_status_buffer(buf, sizeof(buf), off);
 
