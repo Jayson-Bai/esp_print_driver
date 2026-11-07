@@ -978,7 +978,7 @@ static void status_task(void *pvParameters)
                        uart_parse_error_count);
         send_status_buffer(buf, sizeof(buf), len);
 
-        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(1000));
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(200));
     }
 }
 
