@@ -1,6 +1,6 @@
 idf_component_register(
     
-    SRCS "serial_reader.c"
+    SRCS "serial_reader.c" "uart_tx_dispatch.c" "telemetry_scheduler.c"
 
     INCLUDE_DIRS "." 
 

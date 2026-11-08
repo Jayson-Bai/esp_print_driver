@@ -63,6 +63,11 @@ typedef struct {
     bool host_hold_active;                /* 串口绝对 E 会话是否仍保持驱动器 */
     bool host_sample_valid;               /* 是否已经收到可用的绝对 E 样本 */
     extruder_state_t state;               /* MCU 本地运动状态 */
+    /* 仅供遥测调度判断活跃/代次的观测字段，不影响控制路径。 */
+    uint32_t reset_generation;            /* 账本原点重建代次，复位完成时递增 */
+    bool reset_pending;                   /* 复位请求已受理但尚未排空 */
+    bool reverse_braking;                 /* 反转制动进行中 */
+    bool ui_active;                       /* UI 点动会话活跃 */
 } extruder_status_t;
 
 /* 启动两个挤出器共用的本地规划任务；重复调用不会重复创建任务。 */

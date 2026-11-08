@@ -32,6 +32,7 @@
 #include "pid_ctrl.h"
 #include "fan.h"
 #include "serial_reader.h"
+#include "telemetry_scheduler.h"
 #include "cutter.h"
 #include "extruder_ctrl.h"
 
@@ -88,7 +89,10 @@ void app_main() {
     // 上电轴状态确认后再接收外部切头指令，避免启动竞态。
     serial_tasks_start();
     command_dispatch_task_start();
-    status_task_start();
+    /* UART TX owner must exist before any producer submits frames. */
+    uart_tx_dispatch_start();
+    /* Multi-rate telemetry scheduler replaces the old single 1 Hz status task. */
+    telemetry_scheduler_start();
 
     //gui常驻任务（非临时栈，需要持续运行）
     xTaskCreatePinnedToCore(guiTask, "gui", 8192*2, NULL, 4, NULL, 0);

@@ -5,6 +5,7 @@
 #include "cutter.h"
 #include "temperature.h"
 #include "extruder_ctrl.h"
+#include "uart_tx_dispatch.h"
 #include "driver/gpio.h"
 #include "esp_timer.h"
 #include <stdio.h>
@@ -18,7 +19,6 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 
-static SemaphoreHandle_t g_uart_tx_mutex = NULL;
 
 // 从 uart0 读取数据
 int uart0_read(uint8_t *buf, int max_len, TickType_t ticks_to_wait)
@@ -28,23 +28,6 @@ int uart0_read(uint8_t *buf, int max_len, TickType_t ticks_to_wait)
         buf[len] = '\0'; // 确保以字符串结尾
     }
     return len;
-}
-
-// 向 uart0 发送数据
-esp_err_t uart0_write(const uint8_t *data, int len)
-{
-    if (data == NULL || len <= 0) {
-        return ESP_OK;
-    }
-
-    if (g_uart_tx_mutex != NULL) {
-        xSemaphoreTake(g_uart_tx_mutex, portMAX_DELAY);
-    }
-    int res = uart_write_bytes(UART_PORT, (const char*)data, len);
-    if (g_uart_tx_mutex != NULL) {
-        xSemaphoreGive(g_uart_tx_mutex);
-    }
-    return (res == len) ? ESP_OK : ESP_FAIL;
 }
 
 static volatile int g_current_tool_id = 1; // 1=纤维, 2=树脂
@@ -138,9 +121,6 @@ void uart0_init(int baud_rate)
     uart_driver_install(UART_PORT, BUF_SIZE * 2, BUF_SIZE * 2, 30, &uart_event_queue, 0);
     uart_param_config(UART_PORT, &uart_config);
     uart_set_pin(UART_PORT, UART_TX, UART_RX, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-    if (g_uart_tx_mutex == NULL) {
-        g_uart_tx_mutex = xSemaphoreCreateMutex();
-    }
 }
 
 // ---------------- 工具函数：去尾空白 ----------------
@@ -245,7 +225,7 @@ static void send_uart_line(const char *line)
     if (line == NULL) {
         return;
     }
-    uart0_write((const uint8_t *)line, strlen(line));
+    uart_tx_submit_event(line, strlen(line));
 }
 
 static void update_last_e_status(uint32_t seq, int tool_id, int64_t total_um,
@@ -658,7 +638,7 @@ static void handle_extrude_cmd(uint32_t seq, int tool_id, int64_t total_um,
                            "EACK %" PRIu32 " %d %.6f %" PRId64 "\n",
                            seq, tool_id, (double)total_um / 1000000.0, mcu_us);
         if (len > 0) {
-            send_uart_line(ack);
+            uart_tx_submit_eack(ack, (size_t)len);
             g_last_eack_us = mcu_us;
         }
     }
@@ -702,6 +682,26 @@ static void handle_line(char *cmd, int64_t rx_us)
     }
 
     uart_parse_error_count++;
+}
+
+/* Public copy of the last-E accessor for the telemetry scheduler. */
+void get_last_e_status_public(bool *valid, uint32_t *seq, int *tool_id,
+                              int64_t *total_um, int64_t *mcu_us)
+{
+    get_last_e_status(valid, seq, tool_id, total_um, mcu_us);
+}
+
+void get_uart_counters(uint32_t *fifo, uint32_t *buf, uint32_t *line,
+                       uint32_t *cmd, uint32_t *old_seq, uint32_t *gap,
+                       uint32_t *perr)
+{
+    if (fifo) *fifo = uart_fifo_ovf_count;
+    if (buf) *buf = uart_buffer_full_count;
+    if (line) *line = uart_line_drop_count;
+    if (cmd) *cmd = uart_cmd_drop_count;
+    if (old_seq) *old_seq = uart_old_seq_count;
+    if (gap) *gap = uart_seq_gap_count;
+    if (perr) *perr = uart_parse_error_count;
 }
 
 int get_current_tool_id(void)
@@ -845,144 +845,4 @@ void serial_tasks_start(void)
     xTaskCreatePinnedToCore(serial_parse_task, "serial_parse", 4096, NULL, 6, NULL, 1);
 }
 
-static const char *extruder_state_name(extruder_state_t state)
-{
-    switch (state) {
-        case EXTRUDER_STATE_IDLE:        return "IDLE";
-        case EXTRUDER_STATE_ENABLE_WAIT: return "ENABLE_WAIT";
-        case EXTRUDER_STATE_ACCEL:       return "ACCEL";
-        case EXTRUDER_STATE_RUN:         return "RUN";
-        case EXTRUDER_STATE_DECEL:       return "DECEL";
-        case EXTRUDER_STATE_DIR_CHANGE:  return "DIR_CHANGE";
-        case EXTRUDER_STATE_HOLD:        return "HOLD";
-        case EXTRUDER_STATE_FAULT:       return "FAULT";
-        case EXTRUDER_STATE_RESETTING:   return "RESETTING";
-        default:                         return "UNKNOWN";
-    }
-}
 
-static void send_status_buffer(char *buf, size_t capacity, int formatted_len)
-{
-    if (buf == NULL || capacity < 2 || formatted_len <= 0) {
-        return;
-    }
-
-    size_t send_len = (size_t)formatted_len;
-    if (send_len >= capacity) {
-        buf[capacity - 2] = '\n';
-        buf[capacity - 1] = '\0';
-        send_len = capacity - 1;
-    }
-    uart0_write((const uint8_t *)buf, (int)send_len);
-}
-
-static void status_task(void *pvParameters)
-{
-    (void)pvParameters;
-
-    char buf[512];
-    TickType_t last_wake = xTaskGetTickCount();
-
-    while (1) {
-        float temp_cf = get_temperature1();
-        float temp_resin = get_temperature2();
-        float target_cf = pid_get_target(1);
-        float target_resin = pid_get_target(2);
-        int fan_ok_cf = fan_get_state(FAN1) ? 1 : 0;
-        int fan_ok_resin = fan_get_state(FAN2) ? 1 : 0;
-        int tool = 0;
-        int err = 0;
-        int sw1 = gpio_get_level(STOP_PIN_1);
-        int sw2 = gpio_get_level(STOP_PIN_2);
-
-        if (sw1 == 0 && sw2 == 0) {
-            tool = 0;
-            err = 1;
-        } else if (sw1 == 0) {
-            tool = 1;
-        } else if (sw2 == 0) {
-            tool = 2;
-        } else {
-            tool = 0;
-        }
-
-        bool last_valid;
-        uint32_t last_seq;
-        int last_tool;
-        int64_t last_total_um;
-        int64_t last_us;
-        get_last_e_status(&last_valid, &last_seq, &last_tool, &last_total_um, &last_us);
-
-        char last_seq_text[16];
-        if (last_valid) {
-            snprintf(last_seq_text, sizeof(last_seq_text), "%" PRIu32, last_seq);
-        } else {
-            memcpy(last_seq_text, "-1", 3);
-        }
-
-        /* STAT 保持原有 UI 状态格式；last_e_abs 仍以 mm 输出。 */
-        int len = snprintf(buf, sizeof(buf),
-                           "STAT temp_cf=%.1f temp_resin=%.1f target_cf=%.1f target_resin=%.1f "
-                           "fan_ok_cf=%d fan_ok_resin=%d tool=%d err=%d "
-                           "last_e_seq=%s last_e_tool=%d last_e_abs=%.6f last_e_us=%" PRId64 "\n",
-                           temp_cf, temp_resin, target_cf, target_resin,
-                           fan_ok_cf, fan_ok_resin, tool, err,
-                           last_seq_text, last_tool,
-                           (double)last_total_um / 1000000.0, last_us);
-        send_status_buffer(buf, sizeof(buf), len);
-
-        /* 物理限位优先，确保上电已有工作头或UI切头后状态不会沿用旧值。 */
-        int status_tool = (tool == 1 || tool == 2) ? tool : g_current_tool_id;
-        if (status_tool != 1 && status_tool != 2) {
-            status_tool = 1;
-        }
-        extruder_status_t e_status;
-        memset(&e_status, 0, sizeof(e_status));
-        /* ESTAT 是 MCU 本地规划/脉冲账本快照，仅用于监测，不构成执行握手。 */
-        if (extruder_get_status(status_tool, &e_status)) {
-            len = snprintf(buf, sizeof(buf),
-                           "ESTAT tool=%d state=%s target_steps=%" PRId64
-                           " submitted_steps=%" PRId64 " completed_steps=%" PRId64
-                           " host_total_um=%" PRId64 " last_cmd_us=%" PRId64
-                           " ff_until_us=%" PRId64 " ff_sps=%.3f v_sps=%.3f"
-                           " phase=%.6f last_seq=%" PRIu32
-                           " fault=0x%08" PRIx32 " hard_fault=0x%08" PRIx32
-                           " rmt_submit_err=%" PRIu32
-                           " rmt_done_err=%" PRIu32 " qdepth=%" PRIu32
-                           " dir=%d enabled=%d hold_latched=%d host_valid=%d\n",
-                           status_tool, extruder_state_name(e_status.state),
-                           e_status.target_steps, e_status.submitted_steps,
-                           e_status.completed_steps, e_status.host_total_um,
-                           e_status.last_command_us,
-                           e_status.feedforward_valid_until_us,
-                           e_status.feedforward_steps_s,
-                           e_status.velocity_steps_s, e_status.phase, e_status.last_seq,
-                           e_status.fault_flags, e_status.hard_fault_flags,
-                           e_status.rmt_submit_errors,
-                           e_status.rmt_done_errors, e_status.queue_depth,
-                           e_status.direction_sign, e_status.enabled ? 1 : 0,
-                           e_status.host_hold_active ? 1 : 0,
-                           e_status.host_sample_valid ? 1 : 0);
-            send_status_buffer(buf, sizeof(buf), len);
-        }
-
-        /* USTAT 汇总 UART 与软件队列异常，便于无逻辑分析仪时定位链路丢包。 */
-        len = snprintf(buf, sizeof(buf),
-                       "USTAT fifo_ovf=%" PRIu32 " buffer_full=%" PRIu32
-                       " line_drop=%" PRIu32 " cmd_drop=%" PRIu32
-                       " old_seq=%" PRIu32 " seq_gap=%" PRIu32
-                       " parse_err=%" PRIu32 "\n",
-                       uart_fifo_ovf_count, uart_buffer_full_count,
-                       uart_line_drop_count, uart_cmd_drop_count,
-                       uart_old_seq_count, uart_seq_gap_count,
-                       uart_parse_error_count);
-        send_status_buffer(buf, sizeof(buf), len);
-
-        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(1000));
-    }
-}
-
-void status_task_start(void)
-{
-    xTaskCreatePinnedToCore(status_task, "status_pub", 4096, NULL, 1, NULL, 1);
-}

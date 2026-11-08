@@ -1348,6 +1348,10 @@ bool extruder_get_status(int tool_id, extruder_status_t *status)
     status->host_hold_active = runtime->host_hold_active;
     status->host_sample_valid = runtime->host_sample_valid;
     status->state = runtime->state;
+    status->reset_generation = runtime->reset_generation;
+    status->reset_pending = runtime->reset_pending;
+    status->reverse_braking = runtime->reverse_braking;
+    status->ui_active = runtime->ui_active;
     portEXIT_CRITICAL(&g_extruder_mux);
     return true;
 }
